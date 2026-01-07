@@ -169,7 +169,11 @@ class FullyConnectedPrediction(torch.nn.Module):
             self.hidden = torch.nn.Sequential(*hidden_modules)
         else:
             self.hidden = torch.nn.Identity()  # type: ignore
-        self.projection = torch.nn.Linear(curdim, nlabels)
+
+        if prediction_type == "accdoa":
+            self.projection = torch.nn.Linear(curdim, 3 * nlabels)
+        else:
+            self.projection = torch.nn.Linear(curdim, nlabels)
 
         gain = torch.nn.init.calculate_gain(last_activation)
         conf["initialization"](self.projection.weight, gain=gain)
@@ -183,6 +187,9 @@ class FullyConnectedPrediction(torch.nn.Module):
             self.activation = torch.nn.Softmax(dim=1)
             self.logit_loss = OneHotToCrossEntropyLoss()
         elif "regression" in prediction_type:
+            self.activation = torch.nn.Tanh()
+            self.logit_loss = torch.nn.MSELoss()
+        elif prediction_type == "accdoa":
             self.activation = torch.nn.Tanh()
             self.logit_loss = torch.nn.MSELoss()
         else:
@@ -209,6 +216,7 @@ class AbstractPredictionModel(pl.LightningModule):
         scores: List[ScoreFunction],
         conf: Dict,
         use_scoring_for_early_stopping: bool = True,
+        source : str = "static"
     ):
         super().__init__()
 
@@ -226,6 +234,9 @@ class AbstractPredictionModel(pl.LightningModule):
             idx: label for (label, idx) in self.label_to_idx.items()
         }
         self.scores = scores
+        self.prediction_type = prediction_type
+        self.nlabels = nlabels
+        self.source = source
 
     def forward(self, x):
         # x = self.layernorm(x)
@@ -237,6 +248,11 @@ class AbstractPredictionModel(pl.LightningModule):
         # It is independent of forward
         x, y, _ = batch
         y_hat = self.predictor.forward_logit(x)
+        if self.prediction_type == "accdoa" or ("regression" in self.prediction_type):
+            y_hat = self.predictor.activation(y_hat)
+            if self.prediction_type == "accdoa":
+                y_hat = y_hat.view(y.shape[0], self.nlabels, 3)
+
         loss = self.predictor.logit_loss(y_hat, y)
         # Logging to TensorBoard by default
         self.log("train_loss", loss)
@@ -247,11 +263,27 @@ class AbstractPredictionModel(pl.LightningModule):
         x, y, metadata = batch
         y_hat = self.predictor.forward_logit(x)
         y_pr = self.predictor(x)
-        z = {
-            "prediction": y_pr,
-            "prediction_logit": y_hat,
-            "target": y,
-        }
+
+        z = None
+        if self.prediction_type == "accdoa":
+            y_pr = y_pr.view(y.shape[0], self.nlabels, 3)
+            z = {
+                "prediction": y_pr,
+                "target": y,
+            }
+        
+        elif "regression" in self.prediction_type:
+            z = {
+                "prediction": y_pr,
+                "prediction_logit": y_pr,
+                "target": y,
+            }
+        else:
+            z = {
+                "prediction": y_pr,
+                "prediction_logit": y_hat,
+                "target": y,
+            }
         # https://stackoverflow.com/questions/38987/how-do-i-merge-two-dictionaries-in-a-single-expression-taking-union-of-dictiona
         return {**z, **metadata}
 
@@ -391,6 +423,111 @@ class ScenePredictionModel(AbstractPredictionModel):
                 ),
             )
 
+
+class ACCDOAPredictionModel(AbstractPredictionModel):
+    """
+    ACCDOA prediction model. For validation (and test),
+    we combine timestamp events that are adjacent,
+    but discard ones that are too short.
+    """
+
+    def __init__(
+        self,
+        nfeatures: int,
+        label_to_idx: Dict[str, int],
+        nlabels: int,
+        prediction_type: str,
+        scores: List[ScoreFunction],
+        validation_target_events: Dict[str, List[Dict[str, Any]]],
+        test_target_events: Dict[str, List[Dict[str, Any]]],
+        conf: Dict,
+        use_scoring_for_early_stopping: bool = True,
+        source : str = 'static'
+    ):
+        super().__init__(
+            nfeatures=nfeatures,
+            label_to_idx=label_to_idx,
+            nlabels=nlabels,
+            prediction_type=prediction_type,
+            scores=scores,
+            conf=conf,
+            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
+            source = source
+        )
+        self.target_events = {
+            "val": validation_target_events,
+            "test": test_target_events,
+        }
+        self.source = source
+
+    def _score_epoch_end(self, name: str, outputs: List[Dict[str, List[Any]]]):
+        flat_outputs = self._flatten_batched_outputs(
+            outputs,
+            keys=["target", "prediction", "filename", "timestamp"],
+            # This is a list of string, not tensor, so we don't need to stack it
+            dont_stack=["filename"],
+        )
+        target, prediction, filename, timestamp = (
+            flat_outputs[key]
+            for key in [
+                "target",
+                "prediction",
+                "filename",
+                "timestamp",
+            ]
+        )
+
+        self.log(
+            f"{name}_loss",
+            self.predictor.logit_loss(prediction, target),
+            prog_bar=True,
+            logger=True,
+        )
+        epoch = self.current_epoch
+        # print("\n\n\n", epoch)
+
+        if name == "test" or self.use_scoring_for_early_stopping:
+            predicted_events = get_accdoa_events_for_all_files(
+                prediction,
+                filename,
+                timestamp,
+                self.idx_to_label,
+                source = self.source
+            )
+
+            primary_score_fn = self.scores[0]
+            primary_score_ret = primary_score_fn(
+                # predicted_events, self.target_events[name]
+                predicted_events,
+                self.target_events[name],
+            )
+            if isinstance(primary_score_ret, tuple):
+                primary_score = primary_score_ret[0][1]
+            elif isinstance(primary_score_ret, float):
+                primary_score = primary_score_ret
+            else:
+                raise ValueError(
+                    f"Return type {type(primary_score_ret)} is unexpected. "
+                    "Return type of the score function should either be a "
+                    "tuple(tuple) or float. "
+                )
+            if np.isnan(primary_score):
+                primary_score = 0.0
+
+
+            if name == "test":
+                # Cache all predictions for later serialization
+                self.test_predictions = {
+                    "target": target.detach().cpu(),
+                    "prediction": prediction.detach().cpu(),
+                    "target_events": self.target_events[name],
+                    "predicted_events": predicted_events,
+                    "timestamp": timestamp,
+                }
+
+            self.log_scores(
+                name, score_args=(predicted_events, self.target_events[name])
+            )
 
 class EventPredictionModel(AbstractPredictionModel):
     """
@@ -626,18 +763,32 @@ class SplitMemmapDataset(Dataset):
                 ("cartesian" not in task)
                 and ("polar" not in task)
                 and ("distance" not in task)
+                and ("accdoa" not in task)
             ):
                 labels = [self.label_to_idx[str(label)] for label in self.labels[idx]]
                 y = label_to_binary_vector(labels, self.nlabels)
             elif "distance" in task:
                 y = torch.abs(torch.tensor(self.labels[idx]))
+            elif "accdoa" in task:
+                y = torch.zeros((self.nlabels, 3))
+                # active_classes: list of strings (e.g., ["dog", "car"])
+                # active_doas: list of tuples (e.g., [(x1,y1,z1), (x2,y2,z2)])
+                active_classes, active_doas = self.labels[idx]
+                
+                for class_str, doa_tuple in zip(active_classes, active_doas):
+                    # Convert string label to integer index
+                    class_idx = self.label_to_idx[str(class_str)]
+                    y[class_idx] = torch.tensor(doa_tuple).float()
             else:
                 y = torch.tensor(self.labels[idx])
             ys.append(y)
         self.y = torch.stack(ys)
         if self.y.ndim == 1:
             self.y = self.y.unsqueeze(1)
-        assert self.y.shape == (len(self.labels), self.nlabels)
+        if "accdoa" in task:
+            assert self.y.shape == (len(self.labels), self.nlabels, 3)
+        else:
+            assert self.y.shape == (len(self.labels), self.nlabels)
 
     def __len__(self) -> int:
         return self.dim[0]
@@ -721,6 +872,151 @@ def create_events_from_prediction(
                 )
 
     # This is just for pretty output, not really necessary
+    events.sort(key=lambda k: k["start"])
+    return events
+
+
+def get_accdoa_events_for_all_files(
+    predictions: torch.Tensor,
+    filenames: List[str],
+    timestamps: torch.Tensor,
+    idx_to_label: Dict[int, str],
+    threshold = 0.5,
+    source = "static"
+) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
+    """
+    Produces lists of events from a set of frame based label accdoas.
+    The input prediction tensor may contain frame predictions from a set of different
+    files concatenated together. file_timestamps has a list of filenames and
+    timestamps for each frame in the predictions tensor.
+
+    We split the predictions into separate tensors based on the filename and compute
+    events based on those individually.
+
+    If no postprocessing is specified (during training), we try a
+    variety of ways of postprocessing the predictions into events,
+    from the postprocessing_grid including median filtering and
+    minimum event length.
+
+
+    Args:
+        predictions: a tensor of frame based multi-label predictions.
+        filenames: a list of filenames where each entry corresponds
+            to a frame in the predictions tensor.
+        timestamps: a list of timestamps where each entry corresponds
+            to a frame in the predictions tensor.
+        idx_to_label: Index to label mapping.
+        postprocessing: See above.
+
+    Returns:
+        A dictionary from filtering params to the following values:
+        A dictionary of lists of events keyed on the filename slug.
+        The event list is of dicts of the following format:
+            {"label": str, "start": float ms, "end": float ms}
+    """
+    # This probably could be more efficient if we make the assumption that
+    # timestamps are in sorted order. But this makes sure of it.
+    assert predictions.shape[0] == len(filenames)
+    assert predictions.shape[0] == len(timestamps)
+    event_files: Dict[str, Dict[float, torch.Tensor]] = {}
+    for i, (filename, timestamp) in tqdm(enumerate(zip(filenames, timestamps))):
+        slug = Path(filename).name
+
+        # Key on the slug to be consistent with the ground truth
+        if slug not in event_files:
+            event_files[slug] = {}
+
+        # Save the predictions for the file keyed on the timestamp
+        event_files[slug][float(timestamp)] = predictions[i]
+
+    # Create events for all the different files. Store all the events as a dictionary
+    # with the same format as the ground truth from the luigi pipeline.
+    # Ex) { slug -> [{"label" : "woof", "start": 0.0, "end": 2.32}, ...], ...}
+    event_dict: Dict[
+        Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[float, str]]]]
+    ] = {}
+    event_dict = {}
+    for slug, timestamp_predictions in tqdm(event_files.items()):
+        # I think this is wrong; Let's see
+        event_dict[slug] = create_accdoa_events_from_prediction(
+            timestamp_predictions, idx_to_label, threshold = threshold, source = source
+        )
+
+    return event_dict
+
+
+
+
+def create_accdoa_events_from_prediction(
+    prediction_dict: Dict[float, torch.Tensor],
+    idx_to_label: Dict[int, str],
+    threshold: float = 0.5,
+    source = "static"
+) -> List[Dict[str, Union[float, str]]]:
+    """
+    Takes a set of prediction tensors keyed on timestamps and generates events.
+    (This is for one particular audio scene.)
+    We convert the prediction tensor to a binary label based on the threshold value. Any
+    events occurring at adjacent timestamps are considered to be part of the same event.
+    This loops through and creates events for each label class.
+    We optionally apply median filtering to predictions.
+    We disregard events that are less than the min_duration milliseconds.
+
+    Args:
+        prediction_dict: A dictionary of predictions keyed on timestamp
+            {timestamp -> prediction}. The prediction is a tensor of label
+            probabilities.
+        idx_to_label: Index to label mapping.
+        threshold: Threshold for determining whether to apply a label
+        min_duration: the minimum duration in milliseconds for an
+                event to be included.
+
+    Returns:
+        A list of dicts withs keys "label", "start", and "end"
+    """
+    # Make sure the timestamps are in the correct order
+    timestamps = np.array(sorted(prediction_dict.keys()))
+
+    # Create a sorted numpy matrix of frame level predictions for this file. 
+    predictions = np.stack(
+        [prediction_dict[t].detach().cpu().numpy() for t in timestamps]
+    )
+
+    # calculate Activity (L2 Norm of the Cartesian vector)
+    activity = np.linalg.norm(predictions, axis=-1)
+
+    # convert magnitudes to binary activity based on threshold
+    active_binary = (activity > threshold).astype(np.int8)
+
+    events = []
+    for label_idx in range(active_binary.shape[1]):
+        # Find consecutive frames where this class is active
+        for group in more_itertools.consecutive_groups(
+            np.where(active_binary[:, label_idx])[0]
+        ):
+            grouptuple = tuple(group)
+            startidx, endidx = (grouptuple[0], grouptuple[-1])
+
+            start = timestamps[startidx]
+            end = timestamps[endidx]
+            
+            if end - start >= min_duration:
+                # Taking the average vector across the active frames
+                # This is good for static sources.
+                # Handle dynamic ones later.
+                
+                if source == "static":
+                    event_vectors = predictions[startidx:endidx+1, label_idx, :]
+                    mean_vector = np.mean(event_vectors, axis=0)
+                    events.append({
+                        "label": idx_to_label[label_idx], 
+                        "start": start, 
+                        "end": end,
+                        "avg_vector": mean_vector.tolist()
+                    })
+                else:
+                    pass
+
     events.sort(key=lambda k: k["start"])
     return events
 
@@ -1014,18 +1310,33 @@ def task_predictions_train(
         else:
             postprocessing_grid = EVENT_POSTPROCESSING_GRID
 
-        predictor = EventPredictionModel(
-            nfeatures=embedding_size,
-            label_to_idx=label_to_idx,
-            nlabels=nlabels,
-            prediction_type=metadata["prediction_type"],
-            scores=scores,
-            validation_target_events=validation_target_events,
-            test_target_events=test_target_events,
-            postprocessing_grid=postprocessing_grid,
-            conf=conf,
-            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-        )
+
+        if metadata["prediction_type"] == "accdoa":
+            predictor = ACCDOAPredictionModel(
+                nfeatures=embedding_size,
+                label_to_idx=label_to_idx,
+                nlabels=nlabels,
+                prediction_type=metadata["prediction_type"],
+                scores=scores,
+                validation_target_events=validation_target_events,
+                test_target_events=test_target_events,
+                conf=conf,
+                use_scoring_for_early_stopping=use_scoring_for_early_stopping,
+                source = metadata["source_dynamics"]
+            )
+        else:
+            predictor = EventPredictionModel(
+                nfeatures=embedding_size,
+                label_to_idx=label_to_idx,
+                nlabels=nlabels,
+                prediction_type=metadata["prediction_type"],
+                scores=scores,
+                validation_target_events=validation_target_events,
+                test_target_events=test_target_events,
+                postprocessing_grid=postprocessing_grid,
+                conf=conf,
+                use_scoring_for_early_stopping=use_scoring_for_early_stopping,
+            )
     elif metadata["embedding_type"] == "scene":
         predictor = ScenePredictionModel(
             nfeatures=embedding_size,
