@@ -245,6 +245,8 @@ class SoundEventScore(ScoreFunction):
         )
 
         for filename in predictions:
+            #We need to understand here.
+            #It calculates the scores per filename. This is obvious.
             scores.evaluate(
                 reference_event_list=reference_event_list.filter(filename=filename),
                 estimated_event_list=estimated_event_list.filter(filename=filename),
@@ -262,6 +264,7 @@ class SoundEventScore(ScoreFunction):
         )
         # Return the required scores as tuples. The scores are returned in the
         # order they are passed in the `scores` argument
+
         return tuple([(score, overall_scores[score]) for score in self.scores])
 
     @staticmethod
@@ -281,8 +284,297 @@ class SoundEventScore(ScoreFunction):
                         "file": filename,
                     }
                 )
-        return MetaDataContainer(reference_events)
+        return  (reference_events)
 
+#TODO ADD SELD SCORE FROM THE PAPER https://arxiv.org/pdf/1807.00129
+class ACCDOAStaticEventScore(ScoreFunction):
+    """
+    Scores for sound event detection tasks using sed_eval.
+    In this case, we are using ACCDOA for static sources.
+    """
+
+    # Score class must be defined in inheriting classes
+    score_class: sed_eval.sound_event.SoundEventMetrics = None
+
+    def __init__(
+        self,
+        label_to_idx: Dict[str, int],
+        scores: Tuple[str],
+        params: Dict = None,
+        name: Optional[str] = None,
+        maximize: bool = True,
+    ):
+        """
+        :param scores: Scores to use, from the list of overall SED eval scores.
+            The first score in the tuple will be the primary score for this metric
+        :param params: Parameters to pass to the scoring function,
+                       see inheriting children for details.
+        """
+        if params is None:
+            params = {}
+        super().__init__(label_to_idx=label_to_idx, name=name, maximize=maximize)
+        self.scores = scores
+        self.params = params
+        assert self.score_class is not None
+
+    def _compute(
+        self, predictions: Dict, targets: Dict, **kwargs
+    ) -> Tuple[Tuple[str, float], ...]:
+        
+        reference_event_list = self.localization_events(targets)
+        estimated_event_list = self.localization_events(predictions)
+        event_label_list = list(self.label_to_idx.keys())
+
+        # Initialize SED evaluation metric, independent of the localization here.
+        sed_scores = self.score_class(
+            event_label_list=event_label_list, **self.params
+        )
+
+        # calculate SED scores per file
+        for filename in predictions:
+            sed_scores.evaluate(
+                reference_event_list=reference_event_list.filter(filename=filename),
+                estimated_event_list=estimated_event_list.filter(filename=filename),
+            )
+
+        nested_overall_scores = sed_scores.results_overall_metrics()
+        overall_scores: Dict[str, float] = dict(
+            ChainMap(*nested_overall_scores.values())
+        )
+        
+        # Calculate Localization scores per file
+        localization_scores_per_file = {}
+        
+        for filename in predictions:
+            target_f = reference_event_list.filter(filename=filename)
+            prediction_f = estimated_event_list.filter(filename=filename)
+            
+            evaluated_length_seconds = max(reference_event_list.max_offset, estimated_event_list.max_offset)
+
+            # Convert to event rolls (grids) for DOA comparison
+            reference_event_roll = self.event_list_to_event_roll_doa(
+                source_event_list=target_f,
+                event_label_list=event_label_list,
+                time_resolution=0.01
+            )
+            
+            estimated_event_roll = self.event_list_to_event_roll_doa(
+                source_event_list=prediction_f,
+                event_label_list=event_label_list,
+                time_resolution=0.01
+            )
+
+            # Calculate DOA errors
+            doa_error_cd = self.calculate_doa_error_class_dependent(
+                estimated_event_roll, reference_event_roll, evaluated_length_seconds
+            )
+            doa_error_tp = self.calculate_doa_error_true_positive(
+                estimated_event_roll, reference_event_roll, evaluated_length_seconds
+            )
+            
+            localization_scores_per_file[filename] = {
+                "doa_error_cd": doa_error_cd, 
+                "doa_error_tp": doa_error_tp
+            }
+
+        # Aggregate localization scores
+        if localization_scores_per_file:
+            # ChainMap requires positional arguments, unpacking values is necessary
+            overall_localization_scores: Dict[str, float] = dict(
+                ChainMap(*localization_scores_per_file.values())
+            )
+        else:
+            overall_localization_scores = {}
+
+        # Merge all scores
+        overall_scores.update(overall_localization_scores)
+        return tuple([(score, overall_scores[score]) for score in self.scores])
+
+    @staticmethod
+    def calculate_doa_error_class_dependent(
+        estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=0.01
+    ):
+        """
+        Calculates Class Dependent Localization Error.
+        Considers all frames where the reference source is active, 
+        comparing with the prediction regardless of classification correctness.
+        """
+        evaluated_length_segments = int(math.ceil(evaluated_length_seconds / time_resolution))
+        reference_event_roll, estimated_event_roll = sed_eval.util.match_event_roll_lengths(
+            reference_event_roll,
+            estimated_event_roll,
+            evaluated_length_segments
+        )
+        
+        err = 0.0
+        count = 0
+        
+        # reference_event_roll shape: [frames, classes, 3]
+        for frame_idx in range(reference_event_roll.shape[0]):
+            annotated_segment = reference_event_roll[frame_idx, :, :]
+            system_segment = estimated_event_roll[frame_idx, :, :] 
+            
+            # Check which classes are active in reference (magnitude > 0)
+            ref_mags = np.linalg.norm(annotated_segment, axis=-1)
+            ref_active_classes = np.where(ref_mags > 0)[0]
+
+            for class_idx in ref_active_classes:
+
+                true_xyz = ref_doa_segment[frame, :]
+                pred_xyz = est_doa_segment[frame, :]
+                
+                sqrt_pred_error = np.sqrt(np.sum((true_xyz - pred_xyz) ** 2))
+                source_localization_error = (
+                    2 * np.arcsin(sqrt_pred_error / 2) * (180 / np.pi)
+                )
+                source_localization_error = np.nan_to_num(source_localization_error, 180)
+                err += source_localization_error
+                count += 1
+                
+        return err / count if count > 0 else 180.0
+        
+    @staticmethod
+    def calculate_doa_error_true_positive(
+        estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=0.01
+    ):
+        """
+        Calculates Localization Error only for True Positives.
+        Considers frames where both reference and estimation are active for the same class.
+        """
+        evaluated_length_segments = int(math.ceil(evaluated_length_seconds / time_resolution))
+        
+        reference_event_roll, estimated_event_roll = sed_eval.util.match_event_roll_lengths(
+            reference_event_roll,
+            estimated_event_roll,
+            evaluated_length_segments
+        )
+        
+        err = 0.0
+        count = 0
+        
+        for frame_idx in range(reference_event_roll.shape[0]):
+            annotated_segment = reference_event_roll[frame_idx, :, :]
+            system_segment = estimated_event_roll[frame_idx, :, :] 
+            
+            ref_mags = np.linalg.norm(annotated_segment, axis=-1)
+            est_mags = np.linalg.norm(system_segment, axis=-1)
+
+            ref_active_classes = np.where(ref_mags > 0)[0]
+            est_active_classes = np.where(est_mags > 0)[0]
+
+            for class_idx in ref_active_classes:
+                # Check for True Positive: Class is active in both Reference and Estimate
+                if class_idx in est_active_classes:
+                    true_xyz = ref_doa_segment[frame, :]
+                    pred_xyz = est_doa_segment[frame, :]
+                    
+                    sqrt_pred_error = np.sqrt(np.sum((true_xyz - pred_xyz) ** 2))
+                    source_localization_error = (
+                        2 * np.arcsin(sqrt_pred_error / 2) * (180 / np.pi)
+                    )
+                    source_localization_error = np.nan_to_num(source_localization_error, 180)
+                    err += source_localization_error
+                    count += 1
+                    
+        return err / count if count > 0 else 180.0
+
+    @staticmethod 
+    def event_list_to_event_roll_doa(source_event_list, event_label_list, time_resolution=0.01):
+        """Convert event list into event roll, with doa matrix.
+
+        Parameters
+        ----------
+        source_event_list : list, shape=(n,)
+            A list containing event dicts
+
+        event_label_list : list, shape=(k,) or None
+            A list of containing unique labels in alphabetical order
+            (Default value = None)
+        time_resolution : float > 0
+            Time resolution in seconds of the event roll
+            (Default value = 0.01)
+
+        Returns
+        -------
+
+        event_roll: np.ndarray, shape=(m,k)
+            Event roll
+
+        """
+
+        if isinstance(source_event_list, dcase_util.containers.MetaDataContainer):
+            max_offset_value = source_event_list.max_offset
+
+            if event_label_list is None:
+                event_label_list = source_event_list.unique_event_labels
+
+        elif isinstance(source_event_list, list):
+            max_offset_value = event_list.max_event_offset(source_event_list)
+
+            if event_label_list is None:
+                event_label_list = event_list.unique_event_labels(source_event_list)
+
+        else:
+            raise ValueError('Unknown source_event_list type.')
+
+        # Initialize event roll
+        event_roll = numpy.zeros((int(math.ceil(max_offset_value * 1 / time_resolution)), len(event_label_list), 3))
+
+        # Fill-in event_roll
+        for event in source_event_list:
+            #Get the index of the event that we have.
+            #This is the estimated event label that we got from the event list.
+
+            pos = event_label_list.index(event['event_label'])
+
+            if 'event_onset' in event and 'event_offset' in event:
+                event_onset = event['event_onset']
+                event_offset = event['event_offset']
+
+            elif 'onset' in event and 'offset' in event:
+                event_onset = event['onset']
+                event_offset = event['offset']
+
+            onset = int(math.floor(event_onset * 1 / float(time_resolution)))
+            offset = int(math.ceil(event_offset * 1 / float(time_resolution)))
+            #The DOA for the correctly classified event is here.
+            event_roll[onset:offset, pos, :] = event["direction"]
+
+        return event_roll
+
+    @staticmethod
+    def localization_events(
+        x: Dict[str, List[Dict[str, Any]]],
+    ) -> dcase_util.containers.MetaDataContainer:
+        """
+        Reformat event dict into a MetaDataContainer for sed_eval.
+        """
+        reference_events = []
+        for filename, event_list in x.items():
+            for event in event_list:
+                reference_events.append(
+                    {
+                        "event_label": str(event["label"]),
+                        "event_onset": event["start"] / 1000.0, # ms to seconds
+                        "event_offset": event["end"] / 1000.0,
+                        "filename": filename,
+                        # Standardize "direction" key for internal usage
+                        "direction": event.get("direction", event.get("doa"))
+                    }
+                )
+        
+        return dcase_util.containers.MetaDataContainer(reference_events)
+
+
+class ACCDOAStaticScore(SoundEventScore):
+    """
+    segment-based scores - the ground truth and system output are compared in a
+    fixed time grid; sound events are marked as active or inactive in each segment;
+
+    See https://tut-arg.github.io/sed_eval/sound_event.html#sed_eval.sound_event.SegmentBasedMetrics # noqa: E501
+    for params.
+    """
+    score_class = sed_eval.sound_event.SegmentBasedMetrics    
 
 class SegmentBasedScore(SoundEventScore):
     """
@@ -623,7 +915,14 @@ available_scores: Dict[str, Callable] = {
     "segment_1s_er": partial(
         SegmentBasedScore,
         name="segment_1s_er",
-        scores=("error_rate",),
+        scores=("error_rate", ""),
+        params={"time_resolution": 1.0},
+        maximize=False,
+    ),
+    'accdoa_static': partial(
+        ACCDOAStaticScore,
+        name="segment_1s_er",
+        scores=("error_rate", "doa_error_cd", "doa_error_tp"),
         params={"time_resolution": 1.0},
         maximize=False,
     ),

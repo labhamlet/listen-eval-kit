@@ -428,7 +428,9 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
     """
     ACCDOA prediction model. For validation (and test),
     we combine timestamp events that are adjacent,
-    but discard ones that are too short.
+    but discard ones that are too short. We also do not use any post-processing step. 
+    Maybe it is possible to use post-processing for only the sound event detection part.
+    Let's get it without it first.
     """
 
     def __init__(
@@ -458,6 +460,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             "val": validation_target_events,
             "test": test_target_events,
         }
+        #If source is dynamic or static
         self.source = source
 
     def _score_epoch_end(self, name: str, outputs: List[Dict[str, List[Any]]]):
@@ -467,6 +470,8 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             # This is a list of string, not tensor, so we don't need to stack it
             dont_stack=["filename"],
         )
+        #Get the target and predictions.
+        #Later we need to post process them.
         target, prediction, filename, timestamp = (
             flat_outputs[key]
             for key in [
@@ -484,9 +489,9 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             logger=True,
         )
         epoch = self.current_epoch
-        # print("\n\n\n", epoch)
 
         if name == "test" or self.use_scoring_for_early_stopping:
+            #Predict the events. Here, we need to have sound event index, and the DOA vector in the predicted event.
             predicted_events = get_accdoa_events_for_all_files(
                 prediction,
                 filename,
@@ -982,40 +987,44 @@ def create_accdoa_events_from_prediction(
         [prediction_dict[t].detach().cpu().numpy() for t in timestamps]
     )
 
+    #Here we calculate the predictions that are above the threshold.
     # calculate Activity (L2 Norm of the Cartesian vector)
     activity = np.linalg.norm(predictions, axis=-1)
 
     # convert magnitudes to binary activity based on threshold
+
     active_binary = (activity > threshold).astype(np.int8)
 
     events = []
     for label_idx in range(active_binary.shape[1]):
         # Find consecutive frames where this class is active
-        for group in more_itertools.consecutive_groups(
-            np.where(active_binary[:, label_idx])[0]
-        ):
-            grouptuple = tuple(group)
-            startidx, endidx = (grouptuple[0], grouptuple[-1])
+        # And collapse into one class.
+        events = None
+        if source == "static":
+            for group in more_itertools.consecutive_groups(
+                np.where(active_binary[:, label_idx])[0]
+            ):
+                grouptuple = tuple(group)
+                startidx, endidx = (grouptuple[0], grouptuple[-1])
 
-            start = timestamps[startidx]
-            end = timestamps[endidx]
-            
-            if end - start >= min_duration:
-                # Taking the average vector across the active frames
-                # This is good for static sources.
-                # Handle dynamic ones later.
+                start = timestamps[startidx]
+                end = timestamps[endidx]
                 
-                if source == "static":
+                if end - start >= min_duration:
+                    # Taking the average vector across the active frames for the predicted class.
+                    # This smoothens the doa_vector predictions.
                     event_vectors = predictions[startidx:endidx+1, label_idx, :]
                     mean_vector = np.mean(event_vectors, axis=0)
                     events.append({
                         "label": idx_to_label[label_idx], 
                         "start": start, 
                         "end": end,
-                        "avg_vector": mean_vector.tolist()
+                        "direction": mean_vector.tolist()
                     })
-                else:
-                    pass
+        else:
+            #TODO: Implement dynamic sources here.
+            events = None
+            raise NotImplementedError("Dynamic sources are not implemented yet")
 
     events.sort(key=lambda k: k["start"])
     return events
