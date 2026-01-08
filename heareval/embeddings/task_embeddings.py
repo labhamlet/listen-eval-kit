@@ -33,7 +33,7 @@ import torchaudio
 # Later publish it to pypi.
 import sys
 
-sys.path.append("/home/gyuksel3/phd/GRAM-JEPA") #Append the root directory. In this case it is GRAM-T
+sys.path.append("../../GRAM-Clean")
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union

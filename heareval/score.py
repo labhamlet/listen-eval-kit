@@ -17,6 +17,59 @@ from dcase_util.containers import MetaDataContainer
 from scipy import stats
 from sklearn.metrics import average_precision_score, roc_auc_score
 
+import math 
+
+def match_event_roll_lengths_doa(event_roll_a, event_roll_b, length=None):
+    """Fix the length of two event rolls (supports 2D and 3D/DOA arrays).
+
+    Parameters
+    ----------
+    event_roll_a: np.ndarray, shape=(m1, k) or (m1, k, 3)
+        Event roll A
+    event_roll_b: np.ndarray, shape=(m2, k) or (m2, k, 3)
+        Event roll B
+    length: int, optional
+        Length of the event roll. If None, shorter event roll is padded to match longer one.
+
+    Returns
+    -------
+    event_roll_a: np.ndarray
+        Padded/Cropped event roll A
+    event_roll_b: np.ndarray
+        Padded/Cropped event roll B
+    """
+    
+    def pad_event_roll(event_roll, target_length):
+        current_length = event_roll.shape[0]
+        if target_length > current_length:
+            padding_length = target_length - current_length
+            
+            # construct shape to support both 2D (SED) and 3D (DOA)
+            pad_shape = list(event_roll.shape)
+            pad_shape[0] = padding_length
+            
+            padding = np.zeros(tuple(pad_shape))
+            event_roll = np.vstack((event_roll, padding))
+        return event_roll
+
+    # Fix durations of both event_rolls to be equal
+    if length is None:
+        length = max(event_roll_b.shape[0], event_roll_a.shape[0])
+    else:
+        length = int(length)
+
+    if length < event_roll_a.shape[0]:
+        event_roll_a = event_roll_a[0:length, ...]
+    else:
+        event_roll_a = pad_event_roll(event_roll_a, length)
+
+    # Handle Event Roll B
+    if length < event_roll_b.shape[0]:
+        event_roll_b = event_roll_b[0:length, ...]
+    else:
+        event_roll_b = pad_event_roll(event_roll_b, length)
+
+    return event_roll_a, event_roll_b
 
 def cartesian_to_spherical(x, y, z):
     """
@@ -374,22 +427,17 @@ class ACCDOAStaticEventScore(ScoreFunction):
             )
             
             localization_scores_per_file[filename] = {
-                "doa_error_cd": doa_error_cd, 
-                "doa_error_tp": doa_error_tp
+                "doa_error_cd": doa_error_cd.item(), 
+                "doa_error_tp": doa_error_tp.item()
             }
 
-        # Aggregate localization scores
-        if localization_scores_per_file:
-            # ChainMap requires positional arguments, unpacking values is necessary
-            overall_localization_scores: Dict[str, float] = dict(
-                ChainMap(*localization_scores_per_file.values())
-            )
-        else:
-            overall_localization_scores = {}
-
+        overall_localization_scores: Dict[str, float] = dict(
+            ChainMap(*localization_scores_per_file.values())
+        )
         # Merge all scores
         overall_scores.update(overall_localization_scores)
         return tuple([(score, overall_scores[score]) for score in self.scores])
+
 
     @staticmethod
     def calculate_doa_error_class_dependent(
@@ -401,7 +449,7 @@ class ACCDOAStaticEventScore(ScoreFunction):
         comparing with the prediction regardless of classification correctness.
         """
         evaluated_length_segments = int(math.ceil(evaluated_length_seconds / time_resolution))
-        reference_event_roll, estimated_event_roll = sed_eval.util.match_event_roll_lengths(
+        reference_event_roll, estimated_event_roll = match_event_roll_lengths_doa(
             reference_event_roll,
             estimated_event_roll,
             evaluated_length_segments
@@ -420,18 +468,17 @@ class ACCDOAStaticEventScore(ScoreFunction):
             ref_active_classes = np.where(ref_mags > 0)[0]
 
             for class_idx in ref_active_classes:
-
-                true_xyz = ref_doa_segment[frame, :]
-                pred_xyz = est_doa_segment[frame, :]
-                
-                sqrt_pred_error = np.sqrt(np.sum((true_xyz - pred_xyz) ** 2))
-                source_localization_error = (
-                    2 * np.arcsin(sqrt_pred_error / 2) * (180 / np.pi)
-                )
-                source_localization_error = np.nan_to_num(source_localization_error, 180)
-                err += source_localization_error
-                count += 1
-                
+                  true_xyz = annotated_segment[class_idx, :]
+                  pred_xyz = system_segment[class_idx, :]
+                  
+                  sqrt_pred_error = np.sqrt(np.sum((true_xyz - pred_xyz) ** 2))
+                  source_localization_error = (
+                      2 * np.arcsin(sqrt_pred_error / 2) * (180 / np.pi)
+                  )
+                  source_localization_error = np.nan_to_num(source_localization_error, 180)
+                  err += source_localization_error
+                  count += 1
+              
         return err / count if count > 0 else 180.0
         
     @staticmethod
@@ -444,7 +491,7 @@ class ACCDOAStaticEventScore(ScoreFunction):
         """
         evaluated_length_segments = int(math.ceil(evaluated_length_seconds / time_resolution))
         
-        reference_event_roll, estimated_event_roll = sed_eval.util.match_event_roll_lengths(
+        reference_event_roll, estimated_event_roll = match_event_roll_lengths_doa(
             reference_event_roll,
             estimated_event_roll,
             evaluated_length_segments
@@ -466,9 +513,9 @@ class ACCDOAStaticEventScore(ScoreFunction):
             for class_idx in ref_active_classes:
                 # Check for True Positive: Class is active in both Reference and Estimate
                 if class_idx in est_active_classes:
-                    true_xyz = ref_doa_segment[frame, :]
-                    pred_xyz = est_doa_segment[frame, :]
-                    
+                    true_xyz = annotated_segment[class_idx, :]
+                    pred_xyz = system_segment[class_idx, :]
+
                     sqrt_pred_error = np.sqrt(np.sum((true_xyz - pred_xyz) ** 2))
                     source_localization_error = (
                         2 * np.arcsin(sqrt_pred_error / 2) * (180 / np.pi)
@@ -503,23 +550,10 @@ class ACCDOAStaticEventScore(ScoreFunction):
 
         """
 
-        if isinstance(source_event_list, dcase_util.containers.MetaDataContainer):
-            max_offset_value = source_event_list.max_offset
-
-            if event_label_list is None:
-                event_label_list = source_event_list.unique_event_labels
-
-        elif isinstance(source_event_list, list):
-            max_offset_value = event_list.max_event_offset(source_event_list)
-
-            if event_label_list is None:
-                event_label_list = event_list.unique_event_labels(source_event_list)
-
-        else:
-            raise ValueError('Unknown source_event_list type.')
+        max_offset_value = source_event_list.max_offset
 
         # Initialize event roll
-        event_roll = numpy.zeros((int(math.ceil(max_offset_value * 1 / time_resolution)), len(event_label_list), 3))
+        event_roll = np.zeros((int(math.ceil(max_offset_value * 1 / time_resolution)), len(event_label_list), 3))
 
         # Fill-in event_roll
         for event in source_event_list:
@@ -546,7 +580,7 @@ class ACCDOAStaticEventScore(ScoreFunction):
     @staticmethod
     def localization_events(
         x: Dict[str, List[Dict[str, Any]]],
-    ) -> dcase_util.containers.MetaDataContainer:
+    ) -> MetaDataContainer:
         """
         Reformat event dict into a MetaDataContainer for sed_eval.
         """
@@ -559,15 +593,14 @@ class ACCDOAStaticEventScore(ScoreFunction):
                         "event_onset": event["start"] / 1000.0, # ms to seconds
                         "event_offset": event["end"] / 1000.0,
                         "filename": filename,
-                        # Standardize "direction" key for internal usage
-                        "direction": event.get("direction", event.get("doa"))
+                        "direction": event["direction"]
                     }
                 )
         
-        return dcase_util.containers.MetaDataContainer(reference_events)
+        return MetaDataContainer(reference_events)
 
 
-class ACCDOAStaticScore(SoundEventScore):
+class ACCDOAStaticScore(ACCDOAStaticEventScore):
     """
     segment-based scores - the ground truth and system output are compared in a
     fixed time grid; sound events are marked as active or inactive in each segment;

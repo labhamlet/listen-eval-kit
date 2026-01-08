@@ -778,7 +778,16 @@ class SplitMemmapDataset(Dataset):
                 y = torch.zeros((self.nlabels, 3))
                 # active_classes: list of strings (e.g., ["dog", "car"])
                 # active_doas: list of tuples (e.g., [(x1,y1,z1), (x2,y2,z2)])
-                active_classes, active_doas = self.labels[idx]
+                if len(self.labels[idx]) == 0:
+                  active_classes = [] 
+                  active_doas = []
+                else:
+                  print(self.labels[idx])
+                  active_classes = []
+                  active_doas = []
+                  for label in self.labels[idx]:
+                    active_classes.append(label[0])
+                    active_doas.append(label[1])
                 
                 for class_str, doa_tuple in zip(active_classes, active_doas):
                     # Convert string label to integer index
@@ -887,6 +896,7 @@ def get_accdoa_events_for_all_files(
     timestamps: torch.Tensor,
     idx_to_label: Dict[int, str],
     threshold = 0.5,
+
     source = "static"
 ) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
     """
@@ -956,7 +966,7 @@ def create_accdoa_events_from_prediction(
     prediction_dict: Dict[float, torch.Tensor],
     idx_to_label: Dict[int, str],
     threshold: float = 0.5,
-    source = "static"
+    source = "static",
 ) -> List[Dict[str, Union[float, str]]]:
     """
     Takes a set of prediction tensors keyed on timestamps and generates events.
@@ -999,7 +1009,6 @@ def create_accdoa_events_from_prediction(
     for label_idx in range(active_binary.shape[1]):
         # Find consecutive frames where this class is active
         # And collapse into one class.
-        events = None
         if source == "static":
             for group in more_itertools.consecutive_groups(
                 np.where(active_binary[:, label_idx])[0]
@@ -1010,17 +1019,14 @@ def create_accdoa_events_from_prediction(
                 start = timestamps[startidx]
                 end = timestamps[endidx]
                 
-                if end - start >= min_duration:
-                    # Taking the average vector across the active frames for the predicted class.
-                    # This smoothens the doa_vector predictions.
-                    event_vectors = predictions[startidx:endidx+1, label_idx, :]
-                    mean_vector = np.mean(event_vectors, axis=0)
-                    events.append({
-                        "label": idx_to_label[label_idx], 
-                        "start": start, 
-                        "end": end,
-                        "direction": mean_vector.tolist()
-                    })
+                event_vectors = predictions[startidx:endidx+1, label_idx, :]
+                mean_vector = np.mean(event_vectors, axis=0)
+                events.append({
+                    "label": idx_to_label[label_idx], 
+                    "start": start, 
+                    "end": end,
+                    "direction": mean_vector.tolist()
+                })
         else:
             #TODO: Implement dynamic sources here.
             events = None
