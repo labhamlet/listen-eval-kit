@@ -248,7 +248,7 @@ def get_labels_for_timestamps(labels: List, timestamps: np.ndarray) -> List:
             # We add 0.0001 so that the end also includes the event
             # Here we add the direction of the event if the interval tree actually contains it!
             if "direction" in event:
-                tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["directon"]))
+                tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["direction"]))
             else:
                 tree.addi(event["start"], event["end"] + 0.0001, event["label"])
 
