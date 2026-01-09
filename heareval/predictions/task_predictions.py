@@ -53,6 +53,9 @@ TASK_SPECIFIC_PARAM_GRID = {
     "dcase2016_task2": {
         # sed_eval is very slow
         "check_val_every_n_epoch": [10],
+    },
+    "tau2018-ov1": {
+        "check_val_every_n_epoch": [5],
     }
 }
 
@@ -75,7 +78,7 @@ PARAM_GRID = {
     # "lr": [1e-2, 3.2e-3, 1e-3, 3.2e-4, 1e-4],
     # "lr": [1e-1, 1e-2, 1e-3, 1e-4, 1e-5],
     "patience": [20],
-    "max_epochs": [500],
+    "max_epochs": [10],
     # "max_epochs": [500, 1000],
     "check_val_every_n_epoch": [3],
     # "check_val_every_n_epoch": [1, 3, 10],
@@ -456,6 +459,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             use_scoring_for_early_stopping=use_scoring_for_early_stopping,
             source = source
         )
+        self.post_processing = None
         self.target_events = {
             "val": validation_target_events,
             "test": test_target_events,
@@ -534,6 +538,21 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 name, score_args=(predicted_events, self.target_events[name])
             )
 
+    def epoch_best_postprocessing_or_default(
+        self, epoch: int
+    ) -> Tuple[Tuple[str, Any], ...]:
+        return None
+        # if self.use_scoring_for_early_stopping:
+        #     try:
+        #         return self.epoch_best_postprocessing[epoch]
+        #     except KeyError:
+        #         print("Got key erorr with epoch number : {k} using the last epoch")
+        #         return self.epoch_best_postprocessing[epoch - 1]
+        # else:
+        #     postprocessing_confs = list(ParameterGrid(self.postprocessing_grid))
+        #     # There can only be one kind of postprocessing
+        #     assert len(postprocessing_confs) == 1
+        #     return tuple(postprocessing_confs[0].items())
 class EventPredictionModel(AbstractPredictionModel):
     """
     Event prediction model. For validation (and test),
@@ -782,7 +801,6 @@ class SplitMemmapDataset(Dataset):
                   active_classes = [] 
                   active_doas = []
                 else:
-                  print(self.labels[idx])
                   active_classes = []
                   active_doas = []
                   for label in self.labels[idx]:
@@ -1231,7 +1249,7 @@ class GridPointResult:
         epoch: int,
         time_in_min: float,
         hparams: Dict[str, Any],
-        postprocessing: Tuple[Tuple[str, Any], ...],
+        postprocessing: Optional[Tuple[Tuple[str, Any], ...]],
         trainer: pl.Trainer,
         validation_score: float,
         score_mode: str,

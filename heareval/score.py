@@ -409,13 +409,13 @@ class ACCDOAStaticEventScore(ScoreFunction):
             reference_event_roll = self.event_list_to_event_roll_doa(
                 source_event_list=target_f,
                 event_label_list=event_label_list,
-                time_resolution=0.01
+                time_resolution=1.0
             )
             
             estimated_event_roll = self.event_list_to_event_roll_doa(
                 source_event_list=prediction_f,
                 event_label_list=event_label_list,
-                time_resolution=0.01
+                time_resolution=1.0
             )
 
             # Calculate DOA errors
@@ -479,11 +479,11 @@ class ACCDOAStaticEventScore(ScoreFunction):
                   err += source_localization_error
                   count += 1
               
-        return err / count if count > 0 else 180.0
+        return err / count if count > 0 else np.array(180.0)
         
     @staticmethod
     def calculate_doa_error_true_positive(
-        estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=0.01
+        estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=1.0
     ):
         """
         Calculates Localization Error only for True Positives.
@@ -524,10 +524,10 @@ class ACCDOAStaticEventScore(ScoreFunction):
                     err += source_localization_error
                     count += 1
                     
-        return err / count if count > 0 else 180.0
+        return err / count if count > 0 else np.array(180.0)
 
     @staticmethod 
-    def event_list_to_event_roll_doa(source_event_list, event_label_list, time_resolution=0.01):
+    def event_list_to_event_roll_doa(source_event_list, event_label_list, time_resolution=1.0):
         """Convert event list into event roll, with doa matrix.
 
         Parameters
