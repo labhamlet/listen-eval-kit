@@ -420,10 +420,12 @@ class ACCDOAStaticEventScore(ScoreFunction):
 
             # Calculate DOA errors
             doa_error_cd = self.calculate_doa_error_class_dependent(
-                estimated_event_roll, reference_event_roll, evaluated_length_seconds
+                estimated_event_roll, reference_event_roll, evaluated_length_seconds,
+                time_resolution = 1.0
             )
             doa_error_tp = self.calculate_doa_error_true_positive(
-                estimated_event_roll, reference_event_roll, evaluated_length_seconds
+                estimated_event_roll, reference_event_roll, evaluated_length_seconds,
+                time_resolution= 1.0
             )
             
             localization_scores_per_file[filename] = {
