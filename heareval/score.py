@@ -431,8 +431,8 @@ class ACCDOAStaticEventScore(ScoreFunction):
             else:
                 lrcd_c.append(0.0)
 
-        overall_scores["LECD"] = np.mean(lecd_c)
-        overall_scores["LRCD"] = np.mean(lrcd_c)
+        overall_scores["LE_cd"] = np.mean(lecd_c)
+        overall_scores["LR_cd"] = np.mean(lrcd_c)
 
         return tuple([(score, overall_scores.get(score, 0.0)) for score in self.scores])
 
@@ -871,7 +871,7 @@ available_scores: Dict[str, Callable] = {
     'accdoa_static': partial(
         ACCDOAStaticScore,
         name="segment_1s_er",
-        scores=("error_rate", "doa_error_cd", "doa_error_tp"),
+        scores=("error_rate", "LE_cd", "LR_cd"),
         params={"time_resolution": 1.0},
         maximize=False,
     ),
