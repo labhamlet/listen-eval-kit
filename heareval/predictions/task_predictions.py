@@ -1067,8 +1067,7 @@ def create_accdoa_events_from_prediction(
     )
 
     #Here we calculate the predictions that are above the threshold.
-    # calculate Activity (L2 Norm of the Cartesian vector)
-    activity = np.linalg.norm(predictions, axis=-1)
+    activity = np.linalg.norm(predictions_doa, axis=-1)
 
     # convert magnitudes to binary activity based on threshold
     predictions_labels = (activity > threshold).astype(np.int8)
