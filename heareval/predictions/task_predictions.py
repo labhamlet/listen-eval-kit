@@ -55,7 +55,7 @@ TASK_SPECIFIC_PARAM_GRID = {
         "check_val_every_n_epoch": [10],
     },
     "tau2018-ov1": {
-        "check_val_every_n_epoch": [5],
+        "check_val_every_n_epoch": [25],
     }
 }
 
