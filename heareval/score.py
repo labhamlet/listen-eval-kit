@@ -71,6 +71,19 @@ def match_event_roll_lengths_doa(event_roll_a, event_roll_b, length=None):
 
     return event_roll_a, event_roll_b
 
+
+#Taken from SELDNet. Used for ACCDOA
+def cart2sph(x, y, z):
+    """
+    Convert Cartesian coordinates to spherical coordinates.
+    Returns: azimuth, elevation, radius
+    """
+    XsqPlusYsq = x ** 2 + y ** 2
+    r = np.sqrt(XsqPlusYsq + z ** 2)               # r
+    elev = np.arctan2(z, np.sqrt(XsqPlusYsq))      # theta (elevation)
+    az = np.arctan2(y, x)                          # phi (azimuth)
+    return az, elev, r
+
 def cartesian_to_spherical(x, y, z):
     """
     Convert Cartesian coordinates to spherical coordinates using elevation angle.
@@ -341,6 +354,38 @@ class SoundEventScore(ScoreFunction):
         return  (reference_events)
 
 #TODO ADD SELD SCORE FROM THE PAPER https://arxiv.org/pdf/1807.00129
+Here is the updated code. I have replaced the helper function with your requested cart2sph and updated the ACCDOAStaticEventScore class methods to use the Great Circle Distance formula (Spherical Distance) instead of the Euclidean approximation.
+
+This fixes the error by converting the Cartesian vectors (X,Y,Z) to Spherical coordinates (Azimuth, Elevation) before calculating the angular error.
+
+1. Update the Helper Function
+
+Replace the old cartesian_to_spherical with your requested version.
+
+code
+Python
+download
+content_copy
+expand_less
+def cart2sph(x, y, z):
+    """
+    Convert Cartesian coordinates to spherical coordinates.
+    Returns: azimuth, elevation, radius
+    """
+    XsqPlusYsq = x ** 2 + y ** 2
+    r = np.sqrt(XsqPlusYsq + z ** 2)               # r
+    elev = np.arctan2(z, np.sqrt(XsqPlusYsq))      # theta (elevation)
+    az = np.arctan2(y, x)                          # phi (azimuth)
+    return az, elev, r
+2. Update the ACCDOAStaticEventScore Class
+
+Here is the corrected class. I have updated calculate_doa_error_class_dependent and calculate_doa_error_true_positive to use the logic you provided.
+
+code
+Python
+download
+content_copy
+expand_less
 class ACCDOAStaticEventScore(ScoreFunction):
     """
     Scores for sound event detection tasks using sed_eval.
@@ -358,12 +403,6 @@ class ACCDOAStaticEventScore(ScoreFunction):
         name: Optional[str] = None,
         maximize: bool = True,
     ):
-        """
-        :param scores: Scores to use, from the list of overall SED eval scores.
-            The first score in the tuple will be the primary score for this metric
-        :param params: Parameters to pass to the scoring function,
-                       see inheriting children for details.
-        """
         if params is None:
             params = {}
         super().__init__(label_to_idx=label_to_idx, name=name, maximize=maximize)
@@ -379,7 +418,7 @@ class ACCDOAStaticEventScore(ScoreFunction):
         estimated_event_list = self.localization_events(predictions)
         event_label_list = list(self.label_to_idx.keys())
 
-        # Initialize SED evaluation metric, independent of the localization here.
+        # Initialize SED evaluation metric
         sed_scores = self.score_class(
             event_label_list=event_label_list, **self.params
         )
@@ -418,7 +457,7 @@ class ACCDOAStaticEventScore(ScoreFunction):
                 time_resolution=1.0
             )
 
-            # Calculate DOA errors
+            # Calculate DOA errors using the new Great Circle Distance logic
             doa_error_cd = self.calculate_doa_error_class_dependent(
                 estimated_event_roll, reference_event_roll, evaluated_length_seconds,
                 time_resolution = 1.0
@@ -429,8 +468,8 @@ class ACCDOAStaticEventScore(ScoreFunction):
             )
             
             localization_scores_per_file[filename] = {
-                "doa_error_cd": doa_error_cd.item(), 
-                "doa_error_tp": doa_error_tp.item()
+                "doa_error_cd": doa_error_cd, 
+                "doa_error_tp": doa_error_tp
             }
 
         overall_localization_scores: Dict[str, float] = dict(
@@ -440,15 +479,12 @@ class ACCDOAStaticEventScore(ScoreFunction):
         overall_scores.update(overall_localization_scores)
         return tuple([(score, overall_scores[score]) for score in self.scores])
 
-
     @staticmethod
     def calculate_doa_error_class_dependent(
         estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=0.01
     ):
         """
-        Calculates Class Dependent Localization Error.
-        Considers all frames where the reference source is active, 
-        comparing with the prediction regardless of classification correctness.
+        Calculates Class Dependent Localization Error using Great Circle Distance.
         """
         evaluated_length_segments = int(math.ceil(evaluated_length_seconds / time_resolution))
         reference_event_roll, estimated_event_roll = match_event_roll_lengths_doa(
@@ -470,26 +506,38 @@ class ACCDOAStaticEventScore(ScoreFunction):
             ref_active_classes = np.where(ref_mags > 0)[0]
 
             for class_idx in ref_active_classes:
-                  true_xyz = annotated_segment[class_idx, :]
-                  pred_xyz = system_segment[class_idx, :]
-                  
-                  sqrt_pred_error = np.sqrt(np.sum((true_xyz - pred_xyz) ** 2))
-                  source_localization_error = (
-                      2 * np.arcsin(sqrt_pred_error / 2) * (180 / np.pi)
-                  )
-                  source_localization_error = np.nan_to_num(source_localization_error, 180)
-                  err += source_localization_error
-                  count += 1
+                true_xyz = annotated_segment[class_idx, :]
+                pred_xyz = system_segment[class_idx, :]
+                
+                target_az_rad, target_el_rad, target_r = cart2sph(true_xyz[0], true_xyz[1], true_xyz[2])
+                pred_az_rad, pred_el_rad, pred_r = cart2sph(pred_xyz[0], pred_xyz[1], pred_xyz[2])
+
+                # Check if prediction is silent (magnitude too close to 0)
+                # If silent, we cannot calculate angle. Assign max error (180).
+                if pred_r < 1e-12:
+                    err += 180.0
+                else:
+                    # Calculate the angular distance (great circle distance)
+                    cos_dist = np.sin(target_el_rad) * np.sin(pred_el_rad) + \
+                               np.cos(target_el_rad) * np.cos(pred_el_rad) * np.cos(target_az_rad - pred_az_rad)
+
+                    # Clip to handle floating point errors
+                    cos_dist = np.clip(cos_dist, -1.0, 1.0)
+
+                    # Convert back to degrees
+                    angular_dist = np.rad2deg(np.arccos(cos_dist))
+                    err += angular_dist
+                
+                count += 1
               
-        return err / count if count > 0 else np.array(180.0)
+        return err / count if count > 0 else 180.0
         
     @staticmethod
     def calculate_doa_error_true_positive(
         estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=1.0
     ):
         """
-        Calculates Localization Error only for True Positives.
-        Considers frames where both reference and estimation are active for the same class.
+        Calculates Localization Error only for True Positives using Great Circle Distance.
         """
         evaluated_length_segments = int(math.ceil(evaluated_length_seconds / time_resolution))
         
@@ -518,87 +566,54 @@ class ACCDOAStaticEventScore(ScoreFunction):
                     true_xyz = annotated_segment[class_idx, :]
                     pred_xyz = system_segment[class_idx, :]
 
-                    sqrt_pred_error = np.sqrt(np.sum((true_xyz - pred_xyz) ** 2))
-                    source_localization_error = (
-                        2 * np.arcsin(sqrt_pred_error / 2) * (180 / np.pi)
-                    )
-                    source_localization_error = np.nan_to_num(source_localization_error, 180)
-                    err += source_localization_error
+                    # Convert to spherical
+                    target_az_rad, target_el_rad, _ = cart2sph(true_xyz[0], true_xyz[1], true_xyz[2])
+                    pred_az_rad, pred_el_rad, _ = cart2sph(pred_xyz[0], pred_xyz[1], pred_xyz[2])
+
+                    # Calculate the angular distance (great circle distance)
+                    cos_dist = np.sin(target_el_rad) * np.sin(pred_el_rad) + \
+                               np.cos(target_el_rad) * np.cos(pred_el_rad) * np.cos(target_az_rad - pred_az_rad)
+
+                    # Clip to handle floating point errors
+                    cos_dist = np.clip(cos_dist, -1.0, 1.0)
+
+                    # Convert back to degrees
+                    angular_dist = np.rad2deg(np.arccos(cos_dist))
+                    
+                    err += angular_dist
                     count += 1
                     
-        return err / count if count > 0 else np.array(180.0)
+        return err / count if count > 0 else np.float64(180.0)
 
     @staticmethod 
     def event_list_to_event_roll_doa(source_event_list, event_label_list, time_resolution=1.0):
-        """Convert event list into event roll, with doa matrix.
-
-        Parameters
-        ----------
-        source_event_list : list, shape=(n,)
-            A list containing event dicts
-
-        event_label_list : list, shape=(k,) or None
-            A list of containing unique labels in alphabetical order
-            (Default value = None)
-        time_resolution : float > 0
-            Time resolution in seconds of the event roll
-            (Default value = 0.01)
-
-        Returns
-        -------
-
-        event_roll: np.ndarray, shape=(m,k)
-            Event roll
-
-        """
-
         max_offset_value = source_event_list.max_offset
-
-        # Initialize event roll
         event_roll = np.zeros((int(math.ceil(max_offset_value * 1 / time_resolution)), len(event_label_list), 3))
-
-        # Fill-in event_roll
         for event in source_event_list:
-            #Get the index of the event that we have.
-            #This is the estimated event label that we got from the event list.
-
             pos = event_label_list.index(event['event_label'])
-
             if 'event_onset' in event and 'event_offset' in event:
                 event_onset = event['event_onset']
                 event_offset = event['event_offset']
-
             elif 'onset' in event and 'offset' in event:
                 event_onset = event['onset']
                 event_offset = event['offset']
-
             onset = int(math.floor(event_onset * 1 / float(time_resolution)))
             offset = int(math.ceil(event_offset * 1 / float(time_resolution)))
-            #The DOA for the correctly classified event is here.
             event_roll[onset:offset, pos, :] = event["direction"]
-
         return event_roll
 
     @staticmethod
-    def localization_events(
-        x: Dict[str, List[Dict[str, Any]]],
-    ) -> MetaDataContainer:
-        """
-        Reformat event dict into a MetaDataContainer for sed_eval.
-        """
+    def localization_events(x: Dict[str, List[Dict[str, Any]]]) -> MetaDataContainer:
         reference_events = []
         for filename, event_list in x.items():
             for event in event_list:
-                reference_events.append(
-                    {
-                        "event_label": str(event["label"]),
-                        "event_onset": event["start"] / 1000.0, # ms to seconds
-                        "event_offset": event["end"] / 1000.0,
-                        "filename": filename,
-                        "direction": event["direction"]
-                    }
-                )
-        
+                reference_events.append({
+                    "event_label": str(event["label"]),
+                    "event_onset": event["start"] / 1000.0,
+                    "event_offset": event["end"] / 1000.0,
+                    "filename": filename,
+                    "direction": event["direction"]
+                })
         return MetaDataContainer(reference_events)
 
 

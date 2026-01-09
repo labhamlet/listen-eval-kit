@@ -532,7 +532,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 predicted_events = predicted_events_by_postprocessing[postprocessing]
                 primary_score_fn = self.scores[0]
                 primary_score_ret = primary_score_fn(
-                    # predicted_events, self.target_events[name]
                     predicted_events,
                     self.target_events[name],
                 )
