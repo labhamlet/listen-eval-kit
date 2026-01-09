@@ -57,6 +57,12 @@ TASK_SPECIFIC_PARAM_GRID = {
     "tau2018-ov1": {
         "check_val_every_n_epoch": [25],
     }
+    "tau2018-ov2": {
+        "check_val_every_n_epoch": [25],
+    }
+    "tau2018-ov3": {
+        "check_val_every_n_epoch": [25],
+    }
 }
 
 PARAM_GRID = {
@@ -78,7 +84,7 @@ PARAM_GRID = {
     # "lr": [1e-2, 3.2e-3, 1e-3, 3.2e-4, 1e-4],
     # "lr": [1e-1, 1e-2, 1e-3, 1e-4, 1e-5],
     "patience": [20],
-    "max_epochs": [10],
+    "max_epochs": [500],
     # "max_epochs": [500, 1000],
     "check_val_every_n_epoch": [3],
     # "check_val_every_n_epoch": [1, 3, 10],
