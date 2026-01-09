@@ -467,6 +467,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             source = source
         )
         self.postprocessing_grid = postprocessing_grid
+        self.epoch_best_postprocessing: Dict[int, Tuple[Tuple[str, Any], ...]] = {}
 
         self.target_events = {
             "val": validation_target_events,
