@@ -58,7 +58,11 @@ TASK_SPECIFIC_PARAM_GRID = {
         "check_val_every_n_epoch": [25]
     },
     "tau2018-ov2": {
-        "check_val_every_n_epoch": [25]
+        "check_val_every_n_epoch": [5],
+        "hidden_layers" : [0],
+        "max_epochs" : [10],
+        "initialization": [torch.nn.init.xavier_uniform_],
+        "lr": [3.2e-3]
     },
     "tau2018-ov3": {
         "check_val_every_n_epoch": [25]
@@ -133,6 +137,13 @@ EVENT_POSTPROCESSING_GRID = {
 
 NUM_WORKERS = int(multiprocessing.cpu_count() / (max(1, torch.cuda.device_count())))
 
+class SetEpochCallback(pl.Callback):
+    def __init__(self, epoch):
+        self.epoch = epoch
+    
+    def on_test_start(self, trainer, pl_module):
+        pl_module._current_epoch = self.epoch
+        print(f"Set epoch to {self.epoch}, model sees: {pl_module.current_epoch}")
 
 class OneHotToCrossEntropyLoss(pl.LightningModule):
     def __init__(self):
@@ -501,12 +512,12 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             prog_bar=True,
             logger=True,
         )
-        #Get the post_processing matrix.
-        epoch = self.current_epoch
+        epoch = getattr(self, "inference_epoch", self.current_epoch)
+        print(f"Epoch: {epoch}")
         if name == "val":
             postprocessing_cached = None
         elif name == "test":
-            postprocessing_cached = self.epoch_best_postprocessing_or_default(epoch)
+            postprocessing_cached = self.epoch_best_postprocessing_or_default(int(epoch))
         else:
             raise ValueError
 
@@ -546,16 +557,12 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 score_and_postprocessing.append((primary_score, postprocessing))
             score_and_postprocessing.sort(reverse=True)
 
-            # for vs in score_and_postprocessing:
-            #    print(vs)
-
             best_postprocessing = score_and_postprocessing[0][1]
             if name == "val":
                 print("BEST POSTPROCESSING", best_postprocessing)
                 for k, v in best_postprocessing:
                     self.log(f"postprocessing/{k}", v, logger=True)
-                print(epoch, flush=True)
-                self.epoch_best_postprocessing[epoch] = best_postprocessing
+                self.epoch_best_postprocessing[int(epoch)] = best_postprocessing
             predicted_events = predicted_events_by_postprocessing[best_postprocessing]
 
             if name == "test":
@@ -563,7 +570,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 self.test_predictions = {
                     "target": target.detach().cpu(),
                     "prediction": prediction.detach().cpu(),
-                    "prediction_logit": prediction_logit.detach().cpu(),
                     "target_events": self.target_events[name],
                     "predicted_events": predicted_events,
                     "timestamp": timestamp,
@@ -578,11 +584,11 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
     ) -> Tuple[Tuple[str, Any], ...]:
 
         if self.use_scoring_for_early_stopping:
-            try:
-                return self.epoch_best_postprocessing[epoch]
-            except KeyError:
-                print("Got key erorr with epoch number : {k} using the last epoch")
-                return self.epoch_best_postprocessing[epoch - 1]
+            if int(epoch) not in self.epoch_best_postprocessing:
+                print(f"Got key {int(epoch)}, this is not in {self.epoch_best_postprocessing.keys()}, returning the last epoch")
+                return self.epoch_best_postprocessing[int(epoch)- 1]
+            else:
+                return self.epoch_best_postprocessing[int(epoch)]
         else:
             postprocessing_confs = list(ParameterGrid(self.postprocessing_grid))
             # There can only be one kind of postprocessing
@@ -668,7 +674,7 @@ class EventPredictionModel(AbstractPredictionModel):
             logger=True,
         )
 
-        epoch = self.current_epoch
+        epoch = getattr(self, "inference_epoch", self.current_epoch)
         if name == "val":
             postprocessing_cached = None
         elif name == "test":
@@ -723,7 +729,6 @@ class EventPredictionModel(AbstractPredictionModel):
                 print("BEST POSTPROCESSING", best_postprocessing)
                 for k, v in best_postprocessing:
                     self.log(f"postprocessing/{k}", v, logger=True)
-                print(epoch, flush=True)
                 self.epoch_best_postprocessing[epoch] = best_postprocessing
             predicted_events = predicted_events_by_postprocessing[best_postprocessing]
 
@@ -1516,6 +1521,7 @@ def task_predictions_train(
         end = time.time()
         time_in_min = (end - start) / 60
         epoch = torch.load(checkpoint_callback.best_model_path, weights_only = False)["epoch"]
+        print(f"Loaded epoch : {epoch}")
         if metadata["embedding_type"] == "event":
             best_postprocessing = predictor.epoch_best_postprocessing_or_default(epoch)
         else:
@@ -1571,16 +1577,15 @@ def task_predictions_test(
     trainer = grid_point.trainer
     # This hack is necessary because we use the best validation epoch to
     # choose the event postprocessing
-    trainer.fit_loop.current_epoch = grid_point.epoch
-
+    trainer.lightning_module.inference_epoch = grid_point.epoch
     # Run tests
     test_results = trainer.test(
         ckpt_path=grid_point.model_path, dataloaders=test_dataloader
     )
     assert len(test_results) == 1, "Should have only one test dataloader"
     test_results = test_results[0]
-    # TODO add IQR range for the DOE here.
     return test_results
+
 
 
 def serialize_value(v):
