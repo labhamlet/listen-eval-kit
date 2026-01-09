@@ -431,8 +431,8 @@ class ACCDOAStaticEventScore(ScoreFunction):
             else:
                 lrcd_c.append(0.0)
 
-        overall_scores["LE_cd"] = np.mean(lecd_c)
-        overall_scores["LR_cd"] = np.mean(lrcd_c)
+        overall_scores["LE_cd"] = np.mean(lecd_c).item()
+        overall_scores["LR_cd"] = np.mean(lrcd_c).item()
 
         return tuple([(score, overall_scores[score]) for score in self.scores])
     @staticmethod

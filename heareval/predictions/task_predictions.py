@@ -525,6 +525,8 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 self.idx_to_label,
                 self.postprocessing_grid,
                 postprocessing_cached,
+                source=self.source
+
             )
 
             score_and_postprocessing = []
@@ -1010,7 +1012,7 @@ def get_accdoa_events_for_all_files(
         event_dict[postprocess] = {}
         for slug, timestamp_predictions in event_files.items():
             event_dict[postprocess][slug] = create_accdoa_events_from_prediction(
-                timestamp_predictions, idx_to_label, **dict(postprocess)
+                timestamp_predictions, idx_to_label,source=source, **dict(postprocess)
             )
     else:
         postprocessing_confs = list(ParameterGrid(postprocessing_grid))
@@ -1020,7 +1022,7 @@ def get_accdoa_events_for_all_files(
             for slug, timestamp_predictions in tqdm(event_files.items()):
                 # I think this is wrong; Let's see
                 event_dict[postprocess][slug] = create_accdoa_events_from_prediction(
-                    timestamp_predictions, idx_to_label, **postprocess_dict
+                    timestamp_predictions, idx_to_label,source=source, **postprocess_dict
                 )
 
     return event_dict
