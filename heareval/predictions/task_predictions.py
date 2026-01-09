@@ -58,11 +58,7 @@ TASK_SPECIFIC_PARAM_GRID = {
         "check_val_every_n_epoch": [25]
     },
     "tau2018-ov2": {
-        "check_val_every_n_epoch": [5],
-        "hidden_layers" : [0],
-        "max_epochs" : [10],
-        "initialization": [torch.nn.init.xavier_uniform_],
-        "lr": [3.2e-3]
+        "check_val_every_n_epoch": [25],
     },
     "tau2018-ov3": {
         "check_val_every_n_epoch": [25]
