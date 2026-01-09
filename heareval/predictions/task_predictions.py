@@ -529,7 +529,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                     predicted_events,
                     self.target_events[name],
                 )
-                print("primary is done")
                 # If the score returns a tuple of scores, the first score
                 # is used
                 if isinstance(primary_score_ret, tuple):
