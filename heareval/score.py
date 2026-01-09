@@ -493,7 +493,7 @@ class ACCDOAStaticEventScore(ScoreFunction):
                 
                 count += 1
               
-        return err / count if count > 0 np.nan
+        return err / count if count > 0 else np.nan
         
     @staticmethod
     def calculate_doa_error_true_positive(
