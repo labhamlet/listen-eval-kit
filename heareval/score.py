@@ -434,8 +434,7 @@ class ACCDOAStaticEventScore(ScoreFunction):
         overall_scores["LE_cd"] = np.mean(lecd_c)
         overall_scores["LR_cd"] = np.mean(lrcd_c)
 
-        return tuple([(score, overall_scores.get(score, 0.0)) for score in self.scores])
-
+        return tuple([(score, overall_scores[score]) for score in self.scores])
     @staticmethod
     def calculate_doa_stats(est_roll, ref_roll, eval_len, time_resolution=1.0):
         """
