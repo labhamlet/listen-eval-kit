@@ -72,7 +72,6 @@ def match_event_roll_lengths_doa(event_roll_a, event_roll_b, length=None):
     return event_roll_a, event_roll_b
 
 
-#Taken from SELDNet. Used for ACCDOA
 def cart2sph(x, y, z):
     """
     Convert Cartesian coordinates to spherical coordinates.
@@ -83,6 +82,7 @@ def cart2sph(x, y, z):
     elev = np.arctan2(z, np.sqrt(XsqPlusYsq))      # theta (elevation)
     az = np.arctan2(y, x)                          # phi (azimuth)
     return az, elev, r
+
 
 def cartesian_to_spherical(x, y, z):
     """
@@ -354,38 +354,6 @@ class SoundEventScore(ScoreFunction):
         return  (reference_events)
 
 #TODO ADD SELD SCORE FROM THE PAPER https://arxiv.org/pdf/1807.00129
-Here is the updated code. I have replaced the helper function with your requested cart2sph and updated the ACCDOAStaticEventScore class methods to use the Great Circle Distance formula (Spherical Distance) instead of the Euclidean approximation.
-
-This fixes the error by converting the Cartesian vectors (X,Y,Z) to Spherical coordinates (Azimuth, Elevation) before calculating the angular error.
-
-1. Update the Helper Function
-
-Replace the old cartesian_to_spherical with your requested version.
-
-code
-Python
-download
-content_copy
-expand_less
-def cart2sph(x, y, z):
-    """
-    Convert Cartesian coordinates to spherical coordinates.
-    Returns: azimuth, elevation, radius
-    """
-    XsqPlusYsq = x ** 2 + y ** 2
-    r = np.sqrt(XsqPlusYsq + z ** 2)               # r
-    elev = np.arctan2(z, np.sqrt(XsqPlusYsq))      # theta (elevation)
-    az = np.arctan2(y, x)                          # phi (azimuth)
-    return az, elev, r
-2. Update the ACCDOAStaticEventScore Class
-
-Here is the corrected class. I have updated calculate_doa_error_class_dependent and calculate_doa_error_true_positive to use the logic you provided.
-
-code
-Python
-download
-content_copy
-expand_less
 class ACCDOAStaticEventScore(ScoreFunction):
     """
     Scores for sound event detection tasks using sed_eval.
