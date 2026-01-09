@@ -496,7 +496,7 @@ class ACCDOAStaticEventScore(ScoreFunction):
                 event_offset = event['offset']
             onset = int(math.floor(event_onset * 1 / float(time_resolution)))
             offset = int(math.ceil(event_offset * 1 / float(time_resolution)))
-            event_roll[onset:offset, pos, :] = event["direction"]
+            event_roll[onset:offset, pos, :] = np.array(event["direction"])
         return event_roll
 
     @staticmethod

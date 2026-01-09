@@ -58,7 +58,7 @@ TASK_SPECIFIC_PARAM_GRID = {
         "check_val_every_n_epoch": [25]
     },
     "tau2018-ov2": {
-        "check_val_every_n_epoch": [25],
+        "check_val_every_n_epoch": [10],
     },
     "tau2018-ov3": {
         "check_val_every_n_epoch": [25]
@@ -125,8 +125,8 @@ FASTER_PARAM_GRID.update(
 
 # These are good for dcase, change for other event-based secret tasks
 EVENT_POSTPROCESSING_GRID = {
-    "median_filter_ms": [250],
-    "min_duration": [125, 250],
+    "median_filter_ms": [250, 500],
+    "min_duration": [250, 500],
     #    "median_filter_ms": [0, 62, 125, 250, 500, 1000],
     #    "min_duration": [0, 62, 125, 250, 500, 1000],
 }
@@ -206,7 +206,7 @@ class FullyConnectedPrediction(torch.nn.Module):
             self.activation = torch.nn.Tanh()
             self.logit_loss = torch.nn.MSELoss()
         elif prediction_type == "accdoa":
-            self.activation = torch.nn.Tanh()
+            self.activation = torch.nn.Identity()
             self.logit_loss = torch.nn.MSELoss()
         else:
             raise ValueError(f"Unknown prediction_type {prediction_type}")
@@ -1096,13 +1096,9 @@ def create_accdoa_events_from_prediction(
                 if end_time - start_time >= min_duration:
                     event_vectors = predictions_doa[startidx:endidx+1, label_idx, :]
                     # re-calculate norms for the specific segment to use as weights
-                    segment_activities = np.linalg.norm(event_vectors, axis=-1, keepdims=True)
-                    weighted_sum = np.sum(event_vectors * segment_activities, axis=0)
-                    mean_vector = weighted_sum / np.sum(segment_activities**2)
+                    mean_vector = np.mean(event_vectors, axis = 0)
                     norm = np.linalg.norm(mean_vector)
-                    
-                    if norm > 0:
-                        mean_vector = mean_vector / norm
+                    mean_vector = mean_vector / norm
 
                     events.append({
                         "label": idx_to_label[label_idx],
