@@ -436,7 +436,8 @@ class ACCDOAStaticEventScore(ScoreFunction):
         )
         
         # Calculate Localization scores per file
-        localization_scores_per_file = {}
+        doa_errors_cd = []
+        doa_errors_tp = []
         
         for filename in predictions:
             target_f = reference_event_list.filter(filename=filename)
@@ -459,25 +460,19 @@ class ACCDOAStaticEventScore(ScoreFunction):
 
             # Calculate DOA errors using the new Great Circle Distance logic
             doa_error_cd = self.calculate_doa_error_class_dependent(
-                estimated_event_roll, reference_event_roll, evaluated_length_seconds,
-                time_resolution = 1.0
+                estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=1.0
             )
             doa_error_tp = self.calculate_doa_error_true_positive(
-                estimated_event_roll, reference_event_roll, evaluated_length_seconds,
-                time_resolution= 1.0
+                estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=1.0
             )
             
-            localization_scores_per_file[filename] = {
-                "doa_error_cd": doa_error_cd, 
-                "doa_error_tp": doa_error_tp
-            }
+            doa_errors_cd.append(doa_error_cd)
+            doa_errors_tp.append(doa_error_tp)
 
-        overall_localization_scores: Dict[str, float] = dict(
-            ChainMap(*localization_scores_per_file.values())
-        )
-        # Merge all scores
-        overall_scores.update(overall_localization_scores)
-        return tuple([(score, overall_scores[score]) for score in self.scores])
+        # file-level Macro Average.
+        overall_scores["doa_error_cd"] = float(np.nanmean(doa_errors_cd)) if doa_errors_cd else 180.0
+        overall_scores["doa_error_tp"] = float(np.nanmean(doa_errors_tp)) if doa_errors_tp else 180.0
+
 
     @staticmethod
     def calculate_doa_error_class_dependent(
@@ -530,7 +525,7 @@ class ACCDOAStaticEventScore(ScoreFunction):
                 
                 count += 1
               
-        return err / count if count > 0 else 180.0
+        return err / count if count > 0 np.nan
         
     @staticmethod
     def calculate_doa_error_true_positive(
