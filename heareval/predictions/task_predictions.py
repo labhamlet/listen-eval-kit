@@ -1089,8 +1089,8 @@ def create_accdoa_events_from_prediction(
                 grouptuple = tuple(group)
                 startidx, endidx = (grouptuple[0], grouptuple[-1])
 
-                start = timestamps[startidx]
-                end = timestamps[endidx]
+                start_time = timestamps[startidx]
+                end_time = timestamps[endidx]
                 if end_time - start_time >= min_duration:
                     event_vectors = predictions_doa[startidx:endidx+1, label_idx, :]
                     # re-calculate norms for the specific segment to use as weights
