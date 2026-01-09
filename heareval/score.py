@@ -355,12 +355,6 @@ class SoundEventScore(ScoreFunction):
 
 #TODO ADD SELD SCORE FROM THE PAPER https://arxiv.org/pdf/1807.00129
 class ACCDOAStaticEventScore(ScoreFunction):
-    """
-    Scores for sound event detection tasks using sed_eval.
-    Includes Class-Aware Localization Error (LECD).
-    """
-
-    # Score class must be defined in inheriting classes
     score_class: sed_eval.sound_event.SoundEventMetrics = None
 
     def __init__(
@@ -371,203 +365,123 @@ class ACCDOAStaticEventScore(ScoreFunction):
         name: Optional[str] = None,
         maximize: bool = True,
     ):
-        if params is None:
-            params = {}
+        if params is None: params = {}
         super().__init__(label_to_idx=label_to_idx, name=name, maximize=maximize)
         self.scores = scores
         self.params = params
         assert self.score_class is not None
 
-    def _compute(
-        self, predictions: Dict, targets: Dict, **kwargs
-    ) -> Tuple[Tuple[str, float], ...]:
-        
+    def _compute(self, predictions: Dict, targets: Dict, **kwargs) -> Tuple[Tuple[str, float], ...]:
         reference_event_list = self.localization_events(targets)
         estimated_event_list = self.localization_events(predictions)
         event_label_list = list(self.label_to_idx.keys())
         num_classes = len(event_label_list)
 
-        sed_scores = self.score_class(
-            event_label_list=event_label_list, **self.params
-        )
+        # Standard SED evaluation
+        sed_scores = self.score_class(event_label_list=event_label_list, **self.params)
 
-        global_class_error_sums = np.zeros(num_classes)
-        global_class_tp_counts = np.zeros(num_classes)
+        # Global accumulators for LECD and LRCD
+        global_err_sums = np.zeros(num_classes)
+        global_tp_counts = np.zeros(num_classes)
+        global_ref_counts = np.zeros(num_classes)  # TP + FN
 
         for filename in predictions:
-            sed_scores.evaluate(
-                reference_event_list=reference_event_list.filter(filename=filename),
-                estimated_event_list=estimated_event_list.filter(filename=filename),
-            )
+            # SED evaluation
+            ref_f = reference_event_list.filter(filename=filename)
+            est_f = estimated_event_list.filter(filename=filename)
+            sed_scores.evaluate(reference_event_list=ref_f, estimated_event_list=est_f)
 
-            target_f = reference_event_list.filter(filename=filename)
-            prediction_f = estimated_event_list.filter(filename=filename)
+            # Localization stats
+            evaluated_length = max(reference_event_list.max_offset, estimated_event_list.max_offset)
             
-            evaluated_length_seconds = max(reference_event_list.max_offset, estimated_event_list.max_offset)
-
-            # Generate Event Rolls (grids)
-            reference_event_roll = self.event_list_to_event_roll_doa(
-                source_event_list=target_f,
-                event_label_list=event_label_list,
-                time_resolution=1.0
+            ref_roll = self.event_list_to_event_roll_doa(
+                ref_f, event_label_list, time_resolution=1.0
             )
-            
-            estimated_event_roll = self.event_list_to_event_roll_doa(
-                source_event_list=prediction_f,
-                event_label_list=event_label_list,
-                time_resolution=1.0
+            est_roll = self.event_list_to_event_roll_doa(
+                est_f, event_label_list, time_resolution=1.0
             )
 
-            # Calculate Stats for this file
-            file_err_sums, file_tp_counts = self.calculate_lecd_stats(
-                estimated_event_roll, 
-                reference_event_roll, 
-                evaluated_length_seconds, 
-                time_resolution=1.0
+            # Get stats for this file
+            f_err, f_tp, f_ref = self.calculate_doa_stats(
+                est_roll, ref_roll, evaluated_length, time_resolution=1.0
             )
 
-            # Accumulate into global stats
-            global_class_error_sums += file_err_sums
-            global_class_tp_counts += file_tp_counts
+            global_err_sums += f_err
+            global_tp_counts += f_tp
+            global_ref_counts += f_ref
 
-        nested_overall_scores = sed_scores.results_overall_metrics()
-        overall_scores: Dict[str, float] = dict(
-            ChainMap(*nested_overall_scores.values())
-        )
+        # Finalize scores
+        nested_scores = sed_scores.results_overall_metrics()
+        overall_scores = dict(ChainMap(*nested_scores.values()))
 
-        # LECD_c = sum(errors_c) / TP_c (if TP_c > 0 else 180)
-        # LECD = sum(LECD_c) / C        
-        lecd_per_class = []
+        # Calculate LECD (Error) and LRCD (Recall)
+        lecd_c = []
+        lrcd_c = []
+
         for c in range(num_classes):
-            if global_class_tp_counts[c] > 0:
-                # Mean angular error for this class
-                avg_error = global_class_error_sums[c] / global_class_tp_counts[c]
-                lecd_per_class.append(avg_error)
+            # LECD: Error / TP
+            if global_tp_counts[c] > 0:
+                lecd_c.append(global_err_sums[c] / global_tp_counts[c])
             else:
-                # "When there are no true positive outputs in a class set 180"
-                lecd_per_class.append(180.0)
-        
-        # Macro average across all classes
-        lecd_score = np.mean(lecd_per_class)
+                lecd_c.append(180.0)
+            
+            # LRCD: TP / (TP + FN) -> TP / Total_Reference
+            if global_ref_counts[c] > 0:
+                lrcd_c.append(global_tp_counts[c] / global_ref_counts[c])
+            else:
+                lrcd_c.append(0.0)
 
-        # Update overall scores
-        overall_scores["LECD"] = lecd_score
+        overall_scores["LECD"] = np.mean(lecd_c)
+        overall_scores["LRCD"] = np.mean(lrcd_c)
 
-        # Return requested scores
-        return tuple([(score, overall_scores[score]) for score in self.scores])
+        return tuple([(score, overall_scores.get(score, 0.0)) for score in self.scores])
 
     @staticmethod
-    def calculate_lecd_stats(
-        estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=1.0
-    ):
+    def calculate_doa_stats(est_roll, ref_roll, eval_len, time_resolution=1.0):
         """
-        Calculates accumulation statistics for LECD:
-        Returns: 
-            error_sums: np.array of shape (num_classes,) - sum of angular errors per class
-            tp_counts: np.array of shape (num_classes,) - count of TPs per class
+        Returns:
+            error_sums: Sum of angular errors per class
+            tp_counts: Count of True Positives per class
+            ref_counts: Count of Ground Truth active frames per class (TP+FN)
         """
-        evaluated_length_segments = int(math.ceil(evaluated_length_seconds / time_resolution))
+        num_segments = int(math.ceil(eval_len / time_resolution))
+        ref_roll, est_roll = match_event_roll_lengths_doa(ref_roll, est_roll, num_segments)
         
-        # Match lengths
-        reference_event_roll, estimated_event_roll = match_event_roll_lengths_doa(
-            reference_event_roll,
-            estimated_event_roll,
-            evaluated_length_segments
-        )
-        
-        num_classes = reference_event_roll.shape[1]
+        num_classes = ref_roll.shape[1]
         error_sums = np.zeros(num_classes)
         tp_counts = np.zeros(num_classes)
+        ref_counts = np.zeros(num_classes)
         
-        # Iterate through frames
-        for frame_idx in range(reference_event_roll.shape[0]):
-            annotated_segment = reference_event_roll[frame_idx, :, :] # (C, 3)
-            system_segment = estimated_event_roll[frame_idx, :, :]    # (C, 3)
+        for i in range(ref_roll.shape[0]):
+            ref_vec = ref_roll[i]
+            est_vec = est_roll[i]
             
-            # Check magnitudes to determine activity
-            ref_mags = np.linalg.norm(annotated_segment, axis=-1)
-            est_mags = np.linalg.norm(system_segment, axis=-1)
+            # Determine active classes based on magnitude
+            ref_active = np.where(np.linalg.norm(ref_vec, axis=-1) > 1e-12)[0]
+            est_active = np.where(np.linalg.norm(est_vec, axis=-1) > 1e-12)[0]
 
-            # Identify Active Classes (Indices)
-            ref_active_classes = np.where(ref_mags > 1e-12)[0]
-            est_active_classes = np.where(est_mags > 1e-12)[0]
+            # Update Reference Counts (TP + FN)
+            ref_counts[ref_active] += 1
 
-            # Find True Positives (Intersection of active classes)
-            tp_classes = np.intersect1d(ref_active_classes, est_active_classes)
+            # Identify TPs
+            tp_classes = np.intersect1d(ref_active, est_active)
 
-            for class_idx in tp_classes:
-                true_xyz = annotated_segment[class_idx, :]
-                pred_xyz = system_segment[class_idx, :]
+            for c in tp_classes:
+                true_xyz = ref_vec[c]
+                pred_xyz = est_vec[c]
 
-                target_az, target_el, _ = cart2sph(true_xyz[0], true_xyz[1], true_xyz[2])
-                pred_az, pred_el, _ = cart2sph(pred_xyz[0], pred_xyz[1], pred_xyz[2])
+                t_az, t_el, _ = cart2sph(*true_xyz)
+                p_az, p_el, _ = cart2sph(*pred_xyz)
 
-                # calculate doa
-                cos_dist = np.sin(target_el) * np.sin(pred_el) + \
-                           np.cos(target_el) * np.cos(pred_el) * np.cos(target_az - pred_az)
-
-                cos_dist = np.clip(cos_dist, -1.0, 1.0)
+                # Great Circle Distance
+                cos_dist = np.sin(t_el) * np.sin(p_el) + \
+                           np.cos(t_el) * np.cos(p_el) * np.cos(t_az - p_az)
                 
-                # Angular error in degrees
-                angular_error = np.rad2deg(np.arccos(cos_dist))
-                
-                error_sums[class_idx] += angular_error
-                tp_counts[class_idx] += 1
+                # Accumulate
+                error_sums[c] += np.rad2deg(np.arccos(np.clip(cos_dist, -1.0, 1.0)))
+                tp_counts[c] += 1
                     
-        return error_sums, tp_counts
-        
-    @staticmethod
-    def calculate_doa_error_true_positive(
-        estimated_event_roll, reference_event_roll, evaluated_length_seconds, time_resolution=1.0
-    ):
-        """
-        Calculates Localization Error only for True Positives using Great Circle Distance.
-        """
-        evaluated_length_segments = int(math.ceil(evaluated_length_seconds / time_resolution))
-        
-        reference_event_roll, estimated_event_roll = match_event_roll_lengths_doa(
-            reference_event_roll,
-            estimated_event_roll,
-            evaluated_length_segments
-        )
-        
-        err = 0.0
-        count = 0
-        
-        for frame_idx in range(reference_event_roll.shape[0]):
-            annotated_segment = reference_event_roll[frame_idx, :, :]
-            system_segment = estimated_event_roll[frame_idx, :, :] 
-            
-            ref_mags = np.linalg.norm(annotated_segment, axis=-1)
-            est_mags = np.linalg.norm(system_segment, axis=-1)
-
-            ref_active_classes = np.where(ref_mags > 0)[0]
-            est_active_classes = np.where(est_mags > 0)[0]
-
-            for class_idx in ref_active_classes:
-                # Check for True Positive: Class is active in both Reference and Estimate
-                if class_idx in est_active_classes:
-                    true_xyz = annotated_segment[class_idx, :]
-                    pred_xyz = system_segment[class_idx, :]
-
-                    # Convert to spherical
-                    target_az_rad, target_el_rad, _ = cart2sph(true_xyz[0], true_xyz[1], true_xyz[2])
-                    pred_az_rad, pred_el_rad, _ = cart2sph(pred_xyz[0], pred_xyz[1], pred_xyz[2])
-
-                    # Calculate the angular distance (great circle distance)
-                    cos_dist = np.sin(target_el_rad) * np.sin(pred_el_rad) + \
-                               np.cos(target_el_rad) * np.cos(pred_el_rad) * np.cos(target_az_rad - pred_az_rad)
-
-                    # Clip to handle floating point errors
-                    cos_dist = np.clip(cos_dist, -1.0, 1.0)
-
-                    # Convert back to degrees
-                    angular_dist = np.rad2deg(np.arccos(cos_dist))
-                    
-                    err += angular_dist
-                    count += 1
-                    
-        return err / count if count > 0 else np.float64(180.0)
+        return error_sums, tp_counts, ref_counts
 
     @staticmethod 
     def event_list_to_event_roll_doa(source_event_list, event_label_list, time_resolution=1.0):
