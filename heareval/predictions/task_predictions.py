@@ -206,7 +206,7 @@ class FullyConnectedPrediction(torch.nn.Module):
             self.activation = torch.nn.Tanh()
             self.logit_loss = torch.nn.MSELoss()
         elif prediction_type == "accdoa":
-            self.activation = torch.nn.Tanh()
+            self.activation = torch.nn.Identity()
             self.logit_loss = torch.nn.MSELoss()
         else:
             raise ValueError(f"Unknown prediction_type {prediction_type}")
@@ -266,6 +266,8 @@ class AbstractPredictionModel(pl.LightningModule):
         y_hat = self.predictor.forward_logit(x)
         if self.prediction_type == "accdoa" or ("regression" in self.prediction_type):
             y_hat = self.predictor.activation(y_hat)
+            if self.prediction_type == "accdoa":
+                y_hat = y_hat.view(y.shape[0], self.nlabels, 3)
 
         loss = self.predictor.logit_loss(y_hat, y)
         # Logging to TensorBoard by default
@@ -280,8 +282,16 @@ class AbstractPredictionModel(pl.LightningModule):
 
         z = None
         if self.prediction_type == "accdoa":
+            y_pr = y_pr.view(y.shape[0], self.nlabels, 3)
             z = {
                 "prediction": y_pr,
+                "target": y,
+            }
+        
+        elif "regression" in self.prediction_type:
+            z = {
+                "prediction": y_pr,
+                "prediction_logit": y_pr,
                 "target": y,
             }
         else:
@@ -428,8 +438,7 @@ class ScenePredictionModel(AbstractPredictionModel):
                     target.detach().cpu().numpy(),
                 ),
             )
-
-
+            
 class ACCDOAPredictionModel(AbstractPredictionModel):
     """
     ACCDOA prediction model. For validation (and test),
@@ -463,7 +472,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             source = source
         )
         self.postprocessing_grid = postprocessing_grid
-        #STARSS23 has labels per 100ms 
+        #STARSS23 has 100ms
         self.ref_timestamp_per_second = 10
         self.target_events = {
             "val": validation_target_events,
@@ -995,11 +1004,30 @@ def get_accdoa_events(
     return event_dict
 
 def get_accdoa_labels(accdoa_in_dict, nb_classes):
-    accdoa_in = np.stack(
-        [accdoa_in_dict[t].detach().cpu().numpy() for t in range(len(accdoa_in_dict))]
-    )
-    x, y, z = accdoa_in[:, :nb_classes], accdoa_in[:, nb_classes:2*nb_classes], accdoa_in[:, 2*nb_classes:]
+    """
+    Extracts SED labels and coordinates from ACCDOA format.
+    
+    Args:
+        accdoa_in_dict: List or Dict of PyTorch tensors (e.g., from model output batches).
+                        Expected shape per tensor: (Batch, Time, 3 * nb_classes)
+        nb_classes: Number of target classes.
+
+    Returns:
+        sed: Boolean array of shape (Total_Frames, nb_classes). 
+             True if the class is active (magnitude > 0.5).
+        accdoa_in: Numpy array of shape (Total_Frames, 3 * nb_classes).
+    """
+    data_list = [accdoa_in_dict[t].detach().cpu().numpy() for t in range(len(accdoa_in_dict))]
+    accdoa_in = np.concatenate(data_list, axis=0)
+
+    accdoa_in = accdoa_in.reshape(-1, 3 * nb_classes)
+
+    x = accdoa_in[:, :nb_classes]
+    y = accdoa_in[:, nb_classes : 2 * nb_classes]
+    z = accdoa_in[:, 2 * nb_classes :]
+    
     sed = np.sqrt(x**2 + y**2 + z**2) > 0.5
+
     return sed, accdoa_in
 
 def create_accdoa_events_from_prediction(
