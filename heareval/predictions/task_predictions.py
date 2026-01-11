@@ -1336,7 +1336,7 @@ def load_timestamps(metadata, split_name):
     )
     timestamps_ = {} 
     for filename, timestamps in json.load(open(filename_timestamps_json)):
-        timestamps_{filename} = timestamps
+        timestamps_[filename] = timestamps
     return timestamps_
 
 
