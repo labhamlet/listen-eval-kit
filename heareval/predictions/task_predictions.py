@@ -524,7 +524,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 self.nlabels
             )
             ref_events = get_accdoa_events(
-                self.target_events[name]                
+                self.target_events[name],             
                 filename,
                 self.nlabels
             )
@@ -1025,7 +1025,7 @@ def get_accdoa_labels(accdoa_in_dict, nb_classes):
     x = accdoa_in[:, :nb_classes]
     y = accdoa_in[:, nb_classes : 2 * nb_classes]
     z = accdoa_in[:, 2 * nb_classes :]
-    
+
     sed = np.sqrt(x**2 + y**2 + z**2) > 0.5
 
     return sed, accdoa_in
