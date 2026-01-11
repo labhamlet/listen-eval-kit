@@ -1088,39 +1088,59 @@ def get_accdoa_events(
 
     return event_dict, diff
 
-def get_accdoa_labels(prediction_dict, nb_classes):
+def get_accdoa_labels(accdoa_in, nb_classes):
     """
     Extracts SED labels and coordinates from ACCDOA format.
     
     Args:
-        accdoa_in_dict: List or Dict of PyTorch tensors (e.g., from model output batches).
-                        Expected shape per tensor: (Batch, Time, 3 * nb_classes)
+        accdoa_in: Can be one of the following:
+                   1. Dict of PyTorch tensors (keys=timestamps, values=tensors).
+                   2. A single PyTorch Tensor of shape (Batch, Time, 3 * nb_classes).
+                   3. A NumPy array of shape (Batch, Time, 3 * nb_classes).
         nb_classes: Number of target classes.
 
     Returns:
-        sed: Boolean array of shape (Total_Frames, nb_classes). 
+        sed: Boolean NumPy array of shape (Total_Frames, nb_classes). 
              True if the class is active (magnitude > 0.5).
-        accdoa_in: Numpy array of shape (Total_Frames, 3 * nb_classes).
+        accdoa_vectors: NumPy array of shape (Total_Frames, 3 * nb_classes).
+                        Contains the raw [x, y, z] coordinates.
     """
+    
+    # 1. Standardize Input to Numpy Array
+    if isinstance(accdoa_in, dict):
+        # Handle dictionary of tensors (e.g., from validation loops)
+        timestamps = sorted(accdoa_in.keys())
+        predictions = [accdoa_in[t] for t in timestamps]
+        
+        # If values are Tensors, detach and move to CPU
+        if torch.is_tensor(predictions[0]):
+            predictions = [p.detach().cpu().numpy() for p in predictions]
+            
+        accdoa_vectors = np.concatenate(predictions, axis=0)
+        
+    elif torch.is_tensor(accdoa_in):
+        # Handle raw PyTorch Tensor
+        accdoa_vectors = accdoa_in.detach().cpu().numpy()
+        
+    else:
+        # Handle NumPy Array
+        accdoa_vectors = accdoa_in
 
-    # Make sure the timestamps are in the correct order
-    timestamps = np.array(sorted(prediction_dict.keys()))
+    # 2. Reshape to (Total_Frames, 3 * nb_classes)
+    # This flattens the Batch and Time dimensions for frame-by-frame evaluation
+    accdoa_vectors = accdoa_vectors.reshape(-1, 3 * nb_classes)
 
-    # Create a sorted numpy matrix of frame level predictions for this file. We convert
-    # to a numpy array here before applying a median filter.
-    predictions = np.stack(
-        [prediction_dict[t].detach().cpu().numpy() for t in timestamps]
-    )
+    # 3. Extract Coordinates (Assumes channel order: [x1..xC, y1..yC, z1..zC])
+    x = accdoa_vectors[:, :nb_classes]
+    y = accdoa_vectors[:, nb_classes : 2 * nb_classes]
+    z = accdoa_vectors[:, 2 * nb_classes :]
 
-    accdoa_in = predictions.reshape(-1, 3 * nb_classes)
+    # 4. Calculate SED (Active if vector magnitude > 0.5)
+    # We use magnitude to determine if a source is active
+    sed_magnitude = np.sqrt(x**2 + y**2 + z**2)
+    sed = sed_magnitude > 0.5
 
-    x = accdoa_in[:, :nb_classes]
-    y = accdoa_in[:, nb_classes : 2 * nb_classes]
-    z = accdoa_in[:, 2 * nb_classes :]
-
-    sed = np.sqrt(x**2 + y**2 + z**2)
-
-    return sed, accdoa_in, np.mean(np.diff(timestamps))
+    return sed, accdoa_vectors
 
 def create_accdoa_events_from_prediction(
     sed_pred : np.array,
