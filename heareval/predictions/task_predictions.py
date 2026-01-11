@@ -978,22 +978,22 @@ def get_accdoa_events(
     # timestamps are in sorted order. But this makes sure of it.
     assert predictions.shape[0] == len(filenames)
     event_files: Dict[str, Dict[int, torch.Tensor]] = {}
-    for frame_idx, filename in tqdm(enumerate(filenames)):
+    for file_idx, filename in tqdm(enumerate(filenames)):
         slug = Path(filename).name
         # Key on the slug to be consistent with the ground truth
         if slug not in event_files:
             event_files[slug] = {}
 
         # Save the predictions for the file keyed on the timestamp
-        event_files[slug][frame_idx] = predictions[frame_idx]
+        event_files[slug] = predictions[file_idx]
 
     event_dict: Dict[
         Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[float, str]]]]
     ] = {}
 
 
-    for file_name in tqdm(event_files.items()):
-        sed_pred, doa_pred = get_accdoa_labels(prediction[file_name], nb_classes)
+    for file_name in tqdm(event_files.keys()):
+        sed_pred, doa_pred = get_accdoa_labels(event_files[file_name], nb_classes)
         accdoa_dict = create_accdoa_events_from_prediction(
             sed_pred, doa_pred, 
             unique_classes=nb_classes
@@ -1003,7 +1003,7 @@ def get_accdoa_events(
 
     return event_dict
 
-def get_accdoa_labels(accdoa_in_dict, nb_classes):
+def get_accdoa_labels(accdoa_in, nb_classes):
     """
     Extracts SED labels and coordinates from ACCDOA format.
     
@@ -1017,7 +1017,7 @@ def get_accdoa_labels(accdoa_in_dict, nb_classes):
              True if the class is active (magnitude > 0.5).
         accdoa_in: Numpy array of shape (Total_Frames, 3 * nb_classes).
     """
-    data_list = [accdoa_in_dict[t].detach().cpu().numpy() for t in range(len(accdoa_in_dict))]
+    data_list = [accdoa_in[t].detach().cpu().numpy() for t in range(len(accdoa_in))]
     accdoa_in = np.concatenate(data_list, axis=0)
 
     accdoa_in = accdoa_in.reshape(-1, 3 * nb_classes)
