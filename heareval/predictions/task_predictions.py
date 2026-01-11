@@ -1330,7 +1330,7 @@ def map_to_frames(target_events: Dict[str, List[Dict[str, Any]]], timestamps: Di
 
     return timestamp_labels
 
-def load_timestamps(metadata, split_name):
+def load_timestamps(embedding_path, metadata, split_name):
     filename_timestamps_json = embedding_path.joinpath(
         f"{split_name}.filename-timestamps.json"
     )
@@ -1408,8 +1408,8 @@ def task_predictions_train(
 
         if metadata["prediction_type"] == "accdoa":
             if metadata["source_dynamics"] == "static":
-                _timestamps_test = load_timestamps(metadata, "test")
-                _timestamps_valid = load_timestamps(metadata, "valid")
+                _timestamps_test = load_timestamps(embedding_path, metadata, "test")
+                _timestamps_valid = load_timestamps(embedding_path, metadata, "valid")
                 validation_target_events: Dict = map_to_frames(validation_target_events, _timestamps_valid)
                 test_target_events: Dict = map_to_frames(test_target_events, _timestamps_test)
             
