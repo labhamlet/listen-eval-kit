@@ -1140,7 +1140,7 @@ def get_accdoa_labels(accdoa_in, nb_classes):
     sed_magnitude = np.sqrt(x**2 + y**2 + z**2)
     sed = sed_magnitude > 0.5
 
-    return sed, accdoa_vectors
+    return sed, accdoa_vectors, np.mean(np.diff(np.array(timestamps)))
 
 def create_accdoa_events_from_prediction(
     sed_pred : np.array,
