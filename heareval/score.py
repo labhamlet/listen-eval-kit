@@ -669,8 +669,6 @@ class SELD(ScoreFunction):
         self.scores = scores
         self.params = params
 
-        assert self.score_class is not None
-
     def _compute(self,
         pred_dicts,
         ref_dicts,
