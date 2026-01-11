@@ -520,15 +520,17 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             pred_events = get_accdoa_events(
                 prediction,
                 filename,
+                timestamp,
                 self.nlabels
             )
             ref_events = get_accdoa_events(
                 self.target_events[name],             
                 filename,
+                timestamp,
                 self.nlabels
             )
             #The time-stamp interval that model produces time-stamps
-            diff = np.mean(np.diff(np.array(timestamps)))
+            diff = np.mean(np.diff(np.array(timestamp)))
             pred_timestamp_per_second = 1000 // diff
             ref_timestamp_per_second = pred_timestamp_per_second if self.source == "static" else self.ref_timestamp_per_second
 
@@ -558,12 +560,15 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                     "target": target.detach().cpu(),
                     "prediction": prediction.detach().cpu(),
                     "target_events": self.target_events[name],
-                    "predicted_events": predicted_events,
+                    "predicted_events": pred_events,
                     "timestamp": timestamp,
                 }
 
             self.log_scores(
-                name, score_args=(predicted_events, self.target_events[name])
+                name, score_args=(pred_events,
+                    ref_events,
+                    pred_timestamp_per_second,
+                    ref_timestamp_per_second)
             )
         
     def epoch_best_postprocessing_or_default(
@@ -942,6 +947,7 @@ def create_events_from_prediction(
 def get_accdoa_events(
     predictions: torch.Tensor,
     filenames: List[str],
+    timestamps,
     nb_classes: int, 
 ) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
     """
@@ -978,14 +984,12 @@ def get_accdoa_events(
     # timestamps are in sorted order. But this makes sure of it.
     assert predictions.shape[0] == len(filenames)
     event_files: Dict[str, Dict[int, torch.Tensor]] = {}
-    for file_idx, filename in tqdm(enumerate(filenames)):
+    for timestamp_idx, (filename, timestamp) in tqdm(enumerate(zip(filenames, timestamps))):
         slug = Path(filename).name
-        # Key on the slug to be consistent with the ground truth
         if slug not in event_files:
-            event_files[slug] = {}
-
+          event_files[slug] = {}
         # Save the predictions for the file keyed on the timestamp
-        event_files[slug] = predictions[file_idx]
+        event_files[slug][timestamp] = predictions[timestamp_idx]
 
     event_dict: Dict[
         Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[float, str]]]]
@@ -1003,7 +1007,7 @@ def get_accdoa_events(
 
     return event_dict
 
-def get_accdoa_labels(accdoa_in, nb_classes):
+def get_accdoa_labels(prediction_dict, nb_classes):
     """
     Extracts SED labels and coordinates from ACCDOA format.
     
@@ -1017,16 +1021,23 @@ def get_accdoa_labels(accdoa_in, nb_classes):
              True if the class is active (magnitude > 0.5).
         accdoa_in: Numpy array of shape (Total_Frames, 3 * nb_classes).
     """
-    data_list = [accdoa_in[t].detach().cpu().numpy() for t in range(len(accdoa_in))]
-    accdoa_in = np.concatenate(data_list, axis=0)
 
-    accdoa_in = accdoa_in.reshape(-1, 3 * nb_classes)
+    # Make sure the timestamps are in the correct order
+    timestamps = np.array(sorted(prediction_dict.keys()))
+
+    # Create a sorted numpy matrix of frame level predictions for this file. We convert
+    # to a numpy array here before applying a median filter.
+    predictions = np.stack(
+        [prediction_dict[t].detach().cpu().numpy() for t in timestamps]
+    )
+
+    accdoa_in = predictions.reshape(-1, 3 * nb_classes)
 
     x = accdoa_in[:, :nb_classes]
     y = accdoa_in[:, nb_classes : 2 * nb_classes]
     z = accdoa_in[:, 2 * nb_classes :]
 
-    sed = np.sqrt(x**2 + y**2 + z**2) > 0.5
+    sed = np.sqrt(x**2 + y**2 + z**2)
 
     return sed, accdoa_in
 
@@ -1056,10 +1067,10 @@ def create_accdoa_events_from_prediction(
     Returns:
         A list of dicts withs keys "label", "start", and "end"
     """
-    output_dict = {}
-
+    output_dict = {}  
     for frame_cnt in range(sed_pred.shape[0]):
         for class_cnt in range(sed_pred.shape[1]):
+            print(sed_pred[frame_cnt][class_cnt])
             if sed_pred[frame_cnt][class_cnt]>0.5:
                 if frame_cnt not in output_dict:
                     output_dict[frame_cnt] = []
