@@ -30,6 +30,7 @@ import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torchinfo
+from intervaltree import IntervalTree
 
 # import wandb
 from pytorch_lightning import seed_everything
@@ -473,10 +474,11 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         )
         #STARSS23 has 100ms
         self.ref_timestamp_per_second = 10
-        self.target_events = {
-            "val": validation_target_events,
-            "test": test_target_events,
-        }
+        if self.source == "static":
+            self.target_events = {
+                "val": map_to_frames(validation_target_events),
+                "test": map_to_frames(test_target_events),
+            }
         #If source is dynamic or static
         self.source = source
 
@@ -1304,6 +1306,40 @@ class GridPointResult:
         )
 
 
+
+def map_to_frames(target_events: Dict[str, List[Dict[str, Any]]], timestamps: Dict[str, List[float]]):
+    #Maps to frames:
+    # {'c0e28dc8.wav': [{'label': 'jack_hammer', 'direction': [-0.5751132772097123, -0.33771451916904743, 0.7451131604793488], 'start': 345.88007775, 'end': 4345.88007775}
+    # A list of labels present at each timestamp
+    timestamp_labels = {}
+
+    for file_name in target_events:
+        events = target_events[file_name]
+        for event in events:
+            tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["direction"]))
+        
+        labels_for_sound = []
+        for time_stamp in enumerate(timestamps[file_name]):
+            interval_labels: List[str | Tuple[str, List[float]]] = [interval.data for interval in tree[time_stamp]]
+            labels_for_sound.append(interval_labels)
+
+        if file_name not in timestamp_labels:
+            timestamp_labels[file_name] = {}
+
+        timestamp_labels[file_name].append(labels_for_sound)
+
+    return timestamp_labels
+
+def load_timestamps(metadata, split_name):
+    filename_timestamps_json = embedding_path.joinpath(
+        f"{split_name}.filename-timestamps.json"
+    )
+    timestamps_ = {} 
+    for filename, timestamps in json.load(open(filename_timestamps_json)):
+        timestamps_{filename} = timestamps
+    return timestamps_
+
+
 def task_predictions_train(
     embedding_path: Path,
     embedding_size: int,
@@ -1327,7 +1363,6 @@ def task_predictions_train(
     start = time.time()
     predictor: AbstractPredictionModel
     if metadata["embedding_type"] == "event":
-
         def _combine_target_events(split_names: List[str]):
             """
             This combines the target events from the list of splits and
@@ -1372,6 +1407,12 @@ def task_predictions_train(
 
 
         if metadata["prediction_type"] == "accdoa":
+            if metadata["source_dynamics"] == "static":
+                _timestamps_test = load_timestamps(metadata, "test")
+                _timestamps_valid = load_timestamps(metadata, "valid")
+                validation_target_events: Dict = map_to_frames(validation_target_events, _timestamps_valid)
+                test_target_events: Dict = map_to_frames(test_target_events, _timestamps_test)
+            
             predictor = ACCDOAPredictionModel(
                 nfeatures=embedding_size,
                 label_to_idx=label_to_idx,
