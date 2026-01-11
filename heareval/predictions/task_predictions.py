@@ -538,7 +538,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 label_to_idx=self.label_to_idx
             )
             #The time-stamp interval that model produces time-stamps
-            pred_timestamp_per_second = 1000 // diff
+            pred_timestamp_per_second = int(1000 // diff)
             ref_timestamp_per_second = pred_timestamp_per_second if self.source == "static" else self.ref_timestamp_per_second
 
             primary_score_fn = self.scores[0]
@@ -1011,16 +1011,16 @@ def get_ref_accdoa_events(
               y[class_idx] = torch.tensor(doa_tuple).float()
           
           event_files[slug][float(timestamp)] = y
+
     event_dict: Dict[
         Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[float, str]]]]
     ] = {}
 
 
     for file_name in tqdm(event_files.keys()):
-        sed_pred, doa_pred = get_accdoa_labels(event_files[file_name], nb_classes)
+        sed_pred, doa_pred, _ = get_accdoa_labels(event_files[file_name], nb_classes)
         accdoa_dict = create_accdoa_events_from_prediction(
             sed_pred, doa_pred, 
-            unique_classes=nb_classes
         )
         max_frames = max(list(accdoa_dict.keys()))
         event_dict[slug] = [accdoa_dict, max_frames]
@@ -1080,105 +1080,95 @@ def get_accdoa_events(
     for file_name in tqdm(event_files.keys()):
         sed_pred, doa_pred, diff = get_accdoa_labels(event_files[file_name], nb_classes)
         accdoa_dict = create_accdoa_events_from_prediction(
-            sed_pred, doa_pred, 
-            unique_classes=nb_classes
-        )
+            sed_pred, doa_pred       
+            )
         max_frames = max(list(accdoa_dict.keys()))
         event_dict[slug] = [accdoa_dict, max_frames]
 
     return event_dict, diff
 
+
 def get_accdoa_labels(accdoa_in, nb_classes):
     """
     Extracts SED labels and coordinates from ACCDOA format.
     
-    Args:
-        accdoa_in: Can be one of the following:
-                   1. Dict of PyTorch tensors (keys=timestamps, values=tensors).
-                   2. A single PyTorch Tensor of shape (Batch, Time, 3 * nb_classes).
-                   3. A NumPy array of shape (Batch, Time, 3 * nb_classes).
-        nb_classes: Number of target classes.
-
     Returns:
-        sed: Boolean NumPy array of shape (Total_Frames, nb_classes). 
-             True if the class is active (magnitude > 0.5).
-        accdoa_vectors: NumPy array of shape (Total_Frames, 3 * nb_classes).
-                        Contains the raw [x, y, z] coordinates.
+        sed: Boolean array (Total_Frames, nb_classes). Active if magnitude > 0.5.
+        accdoa_vectors: Array (Total_Frames, nb_classes, 3). Format [x, y, z].
+        frame_interval: Float (time difference between frames) or Default 0.02.
     """
     
-    # 1. Standardize Input to Numpy Array
+    # 1. Handle Input (Dict vs Tensor) & Timestamps
+    timestamps = None
+
     if isinstance(accdoa_in, dict):
-        # Handle dictionary of tensors (e.g., from validation loops)
         timestamps = sorted(accdoa_in.keys())
         predictions = [accdoa_in[t] for t in timestamps]
+      
         
-        # If values are Tensors, detach and move to CPU
+        # Detach if necessary
         if torch.is_tensor(predictions[0]):
             predictions = [p.detach().cpu().numpy() for p in predictions]
-            
         accdoa_vectors = np.concatenate(predictions, axis=0)
         
     elif torch.is_tensor(accdoa_in):
-        # Handle raw PyTorch Tensor
         accdoa_vectors = accdoa_in.detach().cpu().numpy()
-        
     else:
-        # Handle NumPy Array
         accdoa_vectors = accdoa_in
 
-    # 2. Reshape to (Total_Frames, 3 * nb_classes)
-    # This flattens the Batch and Time dimensions for frame-by-frame evaluation
-    accdoa_vectors = accdoa_vectors.reshape(-1, 3 * nb_classes)
+    accdoa_vectors = accdoa_vectors.reshape(-1, 3, nb_classes)
+    accdoa_vectors = accdoa_vectors.transpose(0, 2, 1)
 
-    # 3. Extract Coordinates (Assumes channel order: [x1..xC, y1..yC, z1..zC])
-    x = accdoa_vectors[:, :nb_classes]
-    y = accdoa_vectors[:, nb_classes : 2 * nb_classes]
-    z = accdoa_vectors[:, 2 * nb_classes :]
+    x = accdoa_vectors[:, :, 0]
+    y = accdoa_vectors[:, :, 1]
+    z = accdoa_vectors[:, :, 2]
 
     # 4. Calculate SED (Active if vector magnitude > 0.5)
-    # We use magnitude to determine if a source is active
     sed_magnitude = np.sqrt(x**2 + y**2 + z**2)
     sed = sed_magnitude > 0.5
 
+      
     return sed, accdoa_vectors, np.mean(np.diff(np.array(timestamps)))
 
 def create_accdoa_events_from_prediction(
-    sed_pred : np.array,
-    doa_pred: np.array,
-    unique_classes: int,
-) -> List[Dict[str, Union[float, str]]]:
+    sed_pred: np.array,
+    doa_pred: np.array
+) -> Dict[int, List[list]]:
     """
-    Takes a set of prediction tensors keyed on timestamps and generates events.
-    (This is for one particular audio scene.)
-    We convert the prediction tensor to a binary label based on the threshold value. Any
-    events occurring at adjacent timestamps are considered to be part of the same event.
-    This loops through and creates events for each label class.
-    We optionally apply median filtering to predictions.
-    We disregard events that are less than the min_duration milliseconds.
-
+    Generates a dictionary of active events per frame.
+    
     Args:
-        prediction_dict: A dictionary of predictions keyed on timestamp
-            {timestamp -> prediction}. The prediction is a tensor of label
-            probabilities.
-        idx_to_label: Index to label mapping.
-        threshold: Threshold for determining whether to apply a label
-        min_duration: the minimum duration in milliseconds for an
-                event to be included.
-
+        sed_pred: Boolean or Float array of shape (Frames, Classes).
+        doa_pred: Coordinate array of shape (Frames, Classes, 3) [x, y, z].
+        
     Returns:
-        A list of dicts withs keys "label", "start", and "end"
+        output_dict: { frame_idx: [[class_idx, x, y, z], ...] }
     """
-    output_dict = {}  
+    output_dict = {}
+    
+    # Ensure sed_pred is boolean (in case raw probabilities were passed)
+    is_active = sed_pred > 0.5 if sed_pred.dtype != bool else sed_pred
+
+    # Iterate through frames
     for frame_cnt in range(sed_pred.shape[0]):
+        active_classes = []
+        
+        # Iterate through classes
         for class_cnt in range(sed_pred.shape[1]):
-            if sed_pred[frame_cnt][class_cnt]>0.5:
-                if frame_cnt not in output_dict:
-                    output_dict[frame_cnt] = []
-                output_dict[frame_cnt].append([class_cnt, 
-                                               doa_pred[frame_cnt][class_cnt], 
-                                               doa_pred[frame_cnt][class_cnt+unique_classes], 
-                                               doa_pred[frame_cnt][class_cnt+2*unique_classes]]) 
+            # If this class is active in this frame
+            if is_active[frame_cnt, class_cnt]:
+                # Get the [x, y, z] vector
+                coords = doa_pred[frame_cnt, class_cnt]
+                
+                # Append [class_idx, x, y, z]
+                active_classes.append([class_cnt, coords[0], coords[1], coords[2]])
+        
+        # Only add to dictionary if there are active events in this frame
+        if active_classes:
+            output_dict[frame_cnt] = active_classes
+            
     return output_dict
+
 
 
 def get_events_for_all_files(
