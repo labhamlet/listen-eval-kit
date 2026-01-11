@@ -206,7 +206,7 @@ class FullyConnectedPrediction(torch.nn.Module):
             self.activation = torch.nn.Tanh()
             self.logit_loss = torch.nn.MSELoss()
         elif prediction_type == "accdoa":
-            self.activation = torch.nn.Identity()
+            self.activation = torch.nn.Tanh()
             self.logit_loss = torch.nn.MSELoss()
         else:
             raise ValueError(f"Unknown prediction_type {prediction_type}")
@@ -266,8 +266,6 @@ class AbstractPredictionModel(pl.LightningModule):
         y_hat = self.predictor.forward_logit(x)
         if self.prediction_type == "accdoa" or ("regression" in self.prediction_type):
             y_hat = self.predictor.activation(y_hat)
-            if self.prediction_type == "accdoa":
-                y_hat = y_hat.view(y.shape[0], self.nlabels, 3)
 
         loss = self.predictor.logit_loss(y_hat, y)
         # Logging to TensorBoard by default
@@ -282,16 +280,8 @@ class AbstractPredictionModel(pl.LightningModule):
 
         z = None
         if self.prediction_type == "accdoa":
-            y_pr = y_pr.view(y.shape[0], self.nlabels, 3)
             z = {
                 "prediction": y_pr,
-                "target": y,
-            }
-        
-        elif "regression" in self.prediction_type:
-            z = {
-                "prediction": y_pr,
-                "prediction_logit": y_pr,
                 "target": y,
             }
         else:
@@ -459,7 +449,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         validation_target_events: Dict[str, List[Dict[str, Any]]],
         test_target_events: Dict[str, List[Dict[str, Any]]],
         conf: Dict,
-        postprocessing_grid: Dict[str, List[float]],
         use_scoring_for_early_stopping: bool = True,
         source : str = 'static'
     ):
@@ -474,14 +463,15 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             source = source
         )
         self.postprocessing_grid = postprocessing_grid
-        self.epoch_best_postprocessing: Dict[int, Tuple[Tuple[str, Any], ...]] = {}
-
+        #STARSS23 has labels per 100ms 
+        self.ref_timestamp_per_second = 10
         self.target_events = {
             "val": validation_target_events,
             "test": test_target_events,
         }
         #If source is dynamic or static
         self.source = source
+
 
     def _score_epoch_end(self, name: str, outputs: List[Dict[str, List[Any]]]):
         flat_outputs = self._flatten_batched_outputs(
@@ -509,7 +499,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             logger=True,
         )
         epoch = getattr(self, "inference_epoch", self.current_epoch)
-        print(f"Epoch: {epoch}")
         if name == "val":
             postprocessing_cached = None
         elif name == "test":
@@ -518,49 +507,42 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             raise ValueError
 
         if name == "test" or self.use_scoring_for_early_stopping:
-            predicted_events_by_postprocessing = get_accdoa_events_for_all_files(
+            #Here we get events for all files per filename.
+            #TODO finish mapping this!
+            pred_events = get_accdoa_events(
                 prediction,
                 filename,
-                timestamp,
-                self.idx_to_label,
-                self.postprocessing_grid,
-                postprocessing_cached,
-                source=self.source
-
+                self.nlabels
             )
+            ref_events = get_accdoa_events(
+                self.target_events[name]                
+                filename,
+                self.nlabels
+            )
+            #The time-stamp interval that model produces time-stamps
+            diff = np.mean(np.diff(np.array(timestamps)))
+            pred_timestamp_per_second = 1000 // diff
+            ref_timestamp_per_second = pred_timestamp_per_second if self.source == "static" else self.ref_timestamp_per_second
 
-            score_and_postprocessing = []
-            for postprocessing in predicted_events_by_postprocessing:
-                predicted_events = predicted_events_by_postprocessing[postprocessing]
-                primary_score_fn = self.scores[0]
-                primary_score_ret = primary_score_fn(
-                    predicted_events,
-                    self.target_events[name],
+            primary_score_fn = self.scores[0]
+            primary_score_ret = primary_score_fn(
+                    pred_events,
+                    ref_events,
+                    pred_timestamp_per_second,
+                    ref_timestamp_per_second,
+            )
+            if isinstance(primary_score_ret, tuple):
+                primary_score = primary_score_ret[0][1]
+            elif isinstance(primary_score_ret, float):
+                primary_score = primary_score_ret
+            else:
+                raise ValueError(
+                    f"Return type {type(primary_score_ret)} is unexpected. "
+                    "Return type of the score function should either be a "
+                    "tuple(tuple) or float. "
                 )
-                # If the score returns a tuple of scores, the first score
-                # is used
-                if isinstance(primary_score_ret, tuple):
-                    primary_score = primary_score_ret[0][1]
-                elif isinstance(primary_score_ret, float):
-                    primary_score = primary_score_ret
-                else:
-                    raise ValueError(
-                        f"Return type {type(primary_score_ret)} is unexpected. "
-                        "Return type of the score function should either be a "
-                        "tuple(tuple) or float. "
-                    )
-                if np.isnan(primary_score):
-                    primary_score = 0.0
-                score_and_postprocessing.append((primary_score, postprocessing))
-            score_and_postprocessing.sort(reverse=True)
-
-            best_postprocessing = score_and_postprocessing[0][1]
-            if name == "val":
-                print("BEST POSTPROCESSING", best_postprocessing)
-                for k, v in best_postprocessing:
-                    self.log(f"postprocessing/{k}", v, logger=True)
-                self.epoch_best_postprocessing[int(epoch)] = best_postprocessing
-            predicted_events = predicted_events_by_postprocessing[best_postprocessing]
+            if np.isnan(primary_score):
+                primary_score = 0.0
 
             if name == "test":
                 # Cache all predictions for later serialization
@@ -948,14 +930,10 @@ def create_events_from_prediction(
     return events
 
 
-def get_accdoa_events_for_all_files(
+def get_accdoa_events(
     predictions: torch.Tensor,
     filenames: List[str],
-    timestamps: torch.Tensor,
-    idx_to_label: Dict[int, str],
-    postprocessing_grid: Dict[str, List[float]],
-    postprocessing: Optional[Tuple[Tuple[str, Any], ...]] = None,
-    source = "static"
+    nb_classes: int, 
 ) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
     """
     Produces lists of events from a set of frame based label accdoas.
@@ -990,53 +968,44 @@ def get_accdoa_events_for_all_files(
     # This probably could be more efficient if we make the assumption that
     # timestamps are in sorted order. But this makes sure of it.
     assert predictions.shape[0] == len(filenames)
-    assert predictions.shape[0] == len(timestamps)
-    event_files: Dict[str, Dict[float, torch.Tensor]] = {}
-    for i, (filename, timestamp) in tqdm(enumerate(zip(filenames, timestamps))):
+    event_files: Dict[str, Dict[int, torch.Tensor]] = {}
+    for frame_idx, filename in tqdm(enumerate(filenames)):
         slug = Path(filename).name
-
         # Key on the slug to be consistent with the ground truth
         if slug not in event_files:
             event_files[slug] = {}
 
         # Save the predictions for the file keyed on the timestamp
-        event_files[slug][float(timestamp)] = predictions[i]
-
+        event_files[slug][frame_idx] = predictions[frame_idx]
 
     event_dict: Dict[
         Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[float, str]]]]
     ] = {}
 
-    if postprocessing:
-        postprocess = postprocessing
-        event_dict[postprocess] = {}
-        for slug, timestamp_predictions in event_files.items():
-            event_dict[postprocess][slug] = create_accdoa_events_from_prediction(
-                timestamp_predictions, idx_to_label,source=source, **dict(postprocess)
-            )
-    else:
-        postprocessing_confs = list(ParameterGrid(postprocessing_grid))
-        for postprocess_dict in tqdm(postprocessing_confs):
-            postprocess = tuple(postprocess_dict.items())
-            event_dict[postprocess] = {}
-            for slug, timestamp_predictions in tqdm(event_files.items()):
-                # I think this is wrong; Let's see
-                event_dict[postprocess][slug] = create_accdoa_events_from_prediction(
-                    timestamp_predictions, idx_to_label,source=source, **postprocess_dict
-                )
+
+    for file_name in tqdm(event_files.items()):
+        sed_pred, doa_pred = get_accdoa_labels(prediction[file_name], nb_classes)
+        accdoa_dict = create_accdoa_events_from_prediction(
+            sed_pred, doa_pred, 
+            unique_classes=nb_classes
+        )
+        max_frames = max(list(accdoa_dict.keys()))
+        event_dict[slug] = [accdoa_dict, max_frames]
 
     return event_dict
 
-
+def get_accdoa_labels(accdoa_in_dict, nb_classes):
+    accdoa_in = np.stack(
+        [accdoa_in_dict[t].detach().cpu().numpy() for t in range(len(accdoa_in_dict))]
+    )
+    x, y, z = accdoa_in[:, :nb_classes], accdoa_in[:, nb_classes:2*nb_classes], accdoa_in[:, 2*nb_classes:]
+    sed = np.sqrt(x**2 + y**2 + z**2) > 0.5
+    return sed, accdoa_in
 
 def create_accdoa_events_from_prediction(
-    prediction_dict: Dict[float, torch.Tensor],
-    idx_to_label: Dict[int, str],
-    threshold: float = 0.5,
-    median_filter_ms: float = 125.0,
-    min_duration : float = 160.0,
-    source = "static",
-    
+    sed_pred : np.array,
+    doa_pred: np.array,
+    unique_classes: int,
 ) -> List[Dict[str, Union[float, str]]]:
     """
     Takes a set of prediction tensors keyed on timestamps and generates events.
@@ -1059,60 +1028,18 @@ def create_accdoa_events_from_prediction(
     Returns:
         A list of dicts withs keys "label", "start", and "end"
     """
-    # Make sure the timestamps are in the correct order
-    timestamps = np.array(sorted(prediction_dict.keys()))
-    ts_diff = np.mean(np.diff(timestamps))
+    output_dict = {}
 
-    # Create a sorted numpy matrix of frame level predictions for this file. 
-    predictions_doa = np.stack(
-        [prediction_dict[t].detach().cpu().numpy() for t in timestamps]
-    )
-
-    #Here we calculate the predictions that are above the threshold.
-    activity = np.linalg.norm(predictions_doa, axis=-1)
-
-    # convert magnitudes to binary activity based on threshold
-    predictions_labels = (activity > threshold).astype(np.int8)
-
-    #We can actually apply this only for static sources.
-    if source == "static" and median_filter_ms:
-      filter_width = int(round(median_filter_ms / ts_diff))
-      if filter_width:
-          predictions_labels = median_filter(predictions_labels, size=(filter_width, 1))
-
-    events = []
-    for label_idx in range(predictions_labels.shape[1]):
-        # Find consecutive frames where this class is active
-        # And collapse into one class.
-        if source == "static":
-            for group in more_itertools.consecutive_groups(
-                np.where(predictions_labels[:, label_idx])[0]
-            ):
-                grouptuple = tuple(group)
-                startidx, endidx = (grouptuple[0], grouptuple[-1])
-
-                start_time = timestamps[startidx]
-                end_time = timestamps[endidx]
-                if end_time - start_time >= min_duration:
-                    event_vectors = predictions_doa[startidx:endidx+1, label_idx, :]
-                    # re-calculate norms for the specific segment to use as weights
-                    mean_vector = np.mean(event_vectors, axis = 0)
-                    norm = np.linalg.norm(mean_vector)
-                    mean_vector = mean_vector / norm
-
-                    events.append({
-                        "label": idx_to_label[label_idx],
-                        "start": start_time,
-                        "end": end_time,
-                        "direction": mean_vector.tolist()
-                    })
-        else:
-            #TODO: Implement dynamic sources here.
-            events = None
-            raise NotImplementedError("Dynamic sources are not implemented yet")
-
-    events.sort(key=lambda k: k["start"])
-    return events
+    for frame_cnt in range(sed_pred.shape[0]):
+        for class_cnt in range(sed_pred.shape[1]):
+            if sed_pred[frame_cnt][class_cnt]>0.5:
+                if frame_cnt not in output_dict:
+                    output_dict[frame_cnt] = []
+                output_dict[frame_cnt].append([class_cnt, 
+                                               doa_pred[frame_cnt][class_cnt], 
+                                               doa_pred[frame_cnt][class_cnt+unique_classes], 
+                                               doa_pred[frame_cnt][class_cnt+2*unique_classes]]) 
+    return output_dict
 
 
 def get_events_for_all_files(

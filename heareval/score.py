@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import sed_eval
 import torch
+import seld_metrics
 
 # Can we get away with not using DCase for every event-based evaluation??
 import dcase_util 
@@ -18,6 +19,49 @@ from scipy import stats
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 import math 
+
+
+def segment_labels(_pred_dict, _max_frames, _nb_label_frames_1s):
+    '''
+        Collects class-wise sound event location information in segments of length 1s from reference dataset
+    :param _pred_dict: Dictionary containing frame-wise sound event time and location information. Output of SELD method
+    :param _max_frames: Total number of frames in the recording
+    :return: Dictionary containing class-wise sound event location information in each segment of audio
+            dictionary_name[segment-index][class-index] = list(frame-cnt-within-segment, azimuth, elevation)
+    '''
+    nb_blocks = int(np.ceil(_max_frames/float(_nb_label_frames_1s)))
+    output_dict = {x: {} for x in range(nb_blocks)}
+    for frame_cnt in range(0, _max_frames, _nb_label_frames_1s):
+
+        # Collect class-wise information for each block
+        # [class][frame] = <list of doa values>
+        # Data structure supports multi-instance occurence of same class
+        block_cnt = frame_cnt // _nb_label_frames_1s
+        loc_dict = {}
+        for audio_frame in range(frame_cnt, frame_cnt+_nb_label_frames_1s):
+            if audio_frame not in _pred_dict:
+                continue
+            for value in _pred_dict[audio_frame]:
+                if value[0] not in loc_dict:
+                    loc_dict[value[0]] = {}
+
+                block_frame = audio_frame - frame_cnt
+                if block_frame not in loc_dict[value[0]]:
+                    loc_dict[value[0]][block_frame] = []
+                loc_dict[value[0]][block_frame].append(value[1:])
+
+        # Update the block wise details collected above in a global structure
+        for class_cnt in loc_dict:
+            if class_cnt not in output_dict[block_cnt]:
+                output_dict[block_cnt][class_cnt] = []
+
+            keys = [k for k in loc_dict[class_cnt]]
+            values = [loc_dict[class_cnt][k] for k in loc_dict[class_cnt]]
+
+            output_dict[block_cnt][class_cnt].append([keys, values])
+
+    return output_dict
+
 
 def match_event_roll_lengths_doa(event_roll_a, event_roll_b, length=None):
     """Fix the length of two event rolls (supports 2D and 3D/DOA arrays).
@@ -353,10 +397,7 @@ class SoundEventScore(ScoreFunction):
                 )
         return  (reference_events)
 
-#TODO ADD SELD SCORE FROM THE PAPER https://arxiv.org/pdf/1807.00129
-class ACCDOAStaticEventScore(ScoreFunction):
-    score_class: sed_eval.sound_event.SoundEventMetrics = None
-
+class SELD(ScoreFunction):
     def __init__(
         self,
         label_to_idx: Dict[str, int],
@@ -369,160 +410,36 @@ class ACCDOAStaticEventScore(ScoreFunction):
         super().__init__(label_to_idx=label_to_idx, name=name, maximize=maximize)
         self.scores = scores
         self.params = params
+
         assert self.score_class is not None
 
-    def _compute(self, predictions: Dict, targets: Dict, **kwargs) -> Tuple[Tuple[str, float], ...]:
-        reference_event_list = self.localization_events(targets)
-        estimated_event_list = self.localization_events(predictions)
-        event_label_list = list(self.label_to_idx.keys())
-        num_classes = len(event_label_list)
+    def _compute(self,
+        pred_dicts,
+        ref_dicts,
+        pred_nb_label_frames_1s,
+        ref_nb_label_frames_1s) -> Tuple[Tuple[str, float], ...]:
+        
+        overall_scores = {}
 
-        # Standard SED evaluation
-        sed_scores = self.score_class(event_label_list=event_label_list, **self.params)
+        eval = seld_metrics.SELDMetrics(nb_classes=self.params["nb_classes"], doa_threshold=self.params["doa_threshold"], average=self.params["average"])
+        for file_name in pred_dicts.keys():
+            pred_dict = pred_dicts[file_name][0]
+            pred_labels = segment_labels(pred_dict, ref_dicts[file_name][1], _nb_label_frames_1s=pred_nb_label_frames_1s)
+            ref_labels = pred_labels = segment_labels(ref_dict[file_name][0], ref_dicts[file_name][1], _nb_label_frames_1s=ref_nb_label_frames_1s)
+            # Calculated scores
+            eval.update_seld_scores(pred_labels, ref_labels)
 
-        # Global accumulators for LECD and LRCD
-        global_err_sums = np.zeros(num_classes)
-        global_tp_counts = np.zeros(num_classes)
-        global_ref_counts = np.zeros(num_classes)  # TP + FN
-
-        for filename in predictions:
-            # SED evaluation
-            ref_f = reference_event_list.filter(filename=filename)
-            est_f = estimated_event_list.filter(filename=filename)
-            sed_scores.evaluate(reference_event_list=ref_f, estimated_event_list=est_f)
-
-            # Localization stats
-            evaluated_length = max(reference_event_list.max_offset, estimated_event_list.max_offset)
-            
-            ref_roll = self.event_list_to_event_roll_doa(
-                ref_f, event_label_list, time_resolution=1.0
-            )
-            est_roll = self.event_list_to_event_roll_doa(
-                est_f, event_label_list, time_resolution=1.0
-            )
-
-            # Get stats for this file
-            f_err, f_tp, f_ref = self.calculate_doa_stats(
-                est_roll, ref_roll, evaluated_length, time_resolution=1.0
-            )
-
-            global_err_sums += f_err
-            global_tp_counts += f_tp
-            global_ref_counts += f_ref
-
-        # Finalize scores
-        nested_scores = sed_scores.results_overall_metrics()
-        overall_scores = dict(ChainMap(*nested_scores.values()))
-
-        # Calculate LECD (Error) and LRCD (Recall)
-        lecd_c = []
-        lrcd_c = []
-
-        for c in range(num_classes):
-            # LECD: Error / TP
-            if global_tp_counts[c] > 0:
-                lecd_c.append(global_err_sums[c] / global_tp_counts[c])
-            else:
-                lecd_c.append(180.0)
-            
-            # LRCD: TP / (TP + FN) -> TP / Total_Reference
-            if global_ref_counts[c] > 0:
-                lrcd_c.append(global_tp_counts[c] / global_ref_counts[c])
-            else:
-                lrcd_c.append(0.0)
-
-        overall_scores["LE_cd"] = np.mean(lecd_c).item()
-        overall_scores["LR_cd"] = np.mean(lrcd_c).item()
+        # Overall SED and DOA scores
+        ER, F, LE, LR, seld_scr, classwise_results = eval.compute_seld_scores()
+        overall_scores["ER"] = ER
+        overall_scores["F"] = F 
+        overall_scores["LE"] = LE
+        overall_scores["LR"] = LR 
+        overall_scores["SELD"] = seld_scr
 
         return tuple([(score, overall_scores[score]) for score in self.scores])
-    @staticmethod
-    def calculate_doa_stats(est_roll, ref_roll, eval_len, time_resolution=1.0):
-        """
-        Returns:
-            error_sums: Sum of angular errors per class
-            tp_counts: Count of True Positives per class
-            ref_counts: Count of Ground Truth active frames per class (TP+FN)
-        """
-        num_segments = int(math.ceil(eval_len / time_resolution))
-        ref_roll, est_roll = match_event_roll_lengths_doa(ref_roll, est_roll, num_segments)
-        
-        num_classes = ref_roll.shape[1]
-        error_sums = np.zeros(num_classes)
-        tp_counts = np.zeros(num_classes)
-        ref_counts = np.zeros(num_classes)
-        
-        for i in range(ref_roll.shape[0]):
-            ref_vec = ref_roll[i]
-            est_vec = est_roll[i]
-            
-            # Determine active classes based on magnitude
-            ref_active = np.where(np.linalg.norm(ref_vec, axis=-1) > 1e-12)[0]
-            est_active = np.where(np.linalg.norm(est_vec, axis=-1) > 1e-12)[0]
-
-            # Update Reference Counts (TP + FN)
-            ref_counts[ref_active] += 1
-
-            # Identify TPs
-            tp_classes = np.intersect1d(ref_active, est_active)
-
-            for c in tp_classes:
-                true_xyz = ref_vec[c]
-                pred_xyz = est_vec[c]
-
-                t_az, t_el, _ = cart2sph(*true_xyz)
-                p_az, p_el, _ = cart2sph(*pred_xyz)
-
-                # Great Circle Distance
-                cos_dist = np.sin(t_el) * np.sin(p_el) + \
-                           np.cos(t_el) * np.cos(p_el) * np.cos(t_az - p_az)
-                
-                # Accumulate
-                error_sums[c] += np.rad2deg(np.arccos(np.clip(cos_dist, -1.0, 1.0)))
-                tp_counts[c] += 1
-                    
-        return error_sums, tp_counts, ref_counts
-
-    @staticmethod 
-    def event_list_to_event_roll_doa(source_event_list, event_label_list, time_resolution=1.0):
-        max_offset_value = source_event_list.max_offset
-        event_roll = np.zeros((int(math.ceil(max_offset_value * 1 / time_resolution)), len(event_label_list), 3))
-        for event in source_event_list:
-            pos = event_label_list.index(event['event_label'])
-            if 'event_onset' in event and 'event_offset' in event:
-                event_onset = event['event_onset']
-                event_offset = event['event_offset']
-            elif 'onset' in event and 'offset' in event:
-                event_onset = event['onset']
-                event_offset = event['offset']
-            onset = int(math.floor(event_onset * 1 / float(time_resolution)))
-            offset = int(math.ceil(event_offset * 1 / float(time_resolution)))
-            event_roll[onset:offset, pos, :] = np.array(event["direction"])
-        return event_roll
-
-    @staticmethod
-    def localization_events(x: Dict[str, List[Dict[str, Any]]]) -> MetaDataContainer:
-        reference_events = []
-        for filename, event_list in x.items():
-            for event in event_list:
-                reference_events.append({
-                    "event_label": str(event["label"]),
-                    "event_onset": event["start"] / 1000.0,
-                    "event_offset": event["end"] / 1000.0,
-                    "filename": filename,
-                    "direction": event["direction"]
-                })
-        return MetaDataContainer(reference_events)
 
 
-class ACCDOAStaticScore(ACCDOAStaticEventScore):
-    """
-    segment-based scores - the ground truth and system output are compared in a
-    fixed time grid; sound events are marked as active or inactive in each segment;
-
-    See https://tut-arg.github.io/sed_eval/sound_event.html#sed_eval.sound_event.SegmentBasedMetrics # noqa: E501
-    for params.
-    """
-    score_class = sed_eval.sound_event.SegmentBasedMetrics    
 
 class SegmentBasedScore(SoundEventScore):
     """
@@ -867,12 +784,12 @@ available_scores: Dict[str, Callable] = {
         params={"time_resolution": 1.0},
         maximize=False,
     ),
-    'accdoa_static': partial(
-        ACCDOAStaticScore,
+    'SELD': partial(
+        SELD,
         name="segment_1s_er",
-        scores=("error_rate", "LE_cd", "LR_cd"),
-        params={"time_resolution": 1.0},
-        maximize=False,
+        scores=("SELD", "ER", "F", "LE", "LR"),
+        params= {"nb_classes": 12, "doa_threshold": 20, "average": "macro"}
+        maximize=True,
     ),
     "mAP": MeanAveragePrecision,
     "d_prime": DPrime,
