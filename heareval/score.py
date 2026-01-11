@@ -1,4 +1,3 @@
-
 """
 Common utils for scoring.
 """
@@ -681,6 +680,8 @@ class SELD(ScoreFunction):
         eval = SELDMetrics(nb_classes=self.params["nb_classes"], doa_threshold=self.params["doa_threshold"], average=self.params["average"])
         for file_name in pred_dicts.keys():
             pred_dict = pred_dicts[file_name][0]
+            print(pred_dict)
+            print(ref_dicts[file_name][0])
             pred_labels = segment_labels(pred_dict, ref_dicts[file_name][1], _nb_label_frames_1s=pred_nb_label_frames_1s)
             ref_labels = pred_labels = segment_labels(ref_dicts[file_name][0], ref_dicts[file_name][1], _nb_label_frames_1s=ref_nb_label_frames_1s)
             # Calculated scores
@@ -1043,9 +1044,9 @@ available_scores: Dict[str, Callable] = {
     ),
     'SELD': partial(
         SELD,
-        name="segment_1s_er",
+        name="SELD",
         scores=("SELD", "ER", "F", "LE", "LR"),
-        params= {"nb_classes": 10, "doa_threshold": 20, "average": "macro"},
+        params= {"nb_classes": 8, "doa_threshold": 50, "average": "macro"},
         maximize=True,
     ),
     "mAP": MeanAveragePrecision,
