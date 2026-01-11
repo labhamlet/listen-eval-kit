@@ -471,7 +471,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             use_scoring_for_early_stopping=use_scoring_for_early_stopping,
             source = source
         )
-        self.postprocessing_grid = postprocessing_grid
         #STARSS23 has 100ms
         self.ref_timestamp_per_second = 10
         self.target_events = {
@@ -570,18 +569,19 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
     def epoch_best_postprocessing_or_default(
         self, epoch: int
     ) -> Tuple[Tuple[str, Any], ...]:
+        return None
 
-        if self.use_scoring_for_early_stopping:
-            if int(epoch) not in self.epoch_best_postprocessing:
-                print(f"Got key {int(epoch)}, this is not in {self.epoch_best_postprocessing.keys()}, returning the last epoch")
-                return self.epoch_best_postprocessing[int(epoch)- 1]
-            else:
-                return self.epoch_best_postprocessing[int(epoch)]
-        else:
-            postprocessing_confs = list(ParameterGrid(self.postprocessing_grid))
-            # There can only be one kind of postprocessing
-            assert len(postprocessing_confs) == 1
-            return tuple(postprocessing_confs[0].items())
+        # if self.use_scoring_for_early_stopping:
+        #     if int(epoch) not in self.epoch_best_postprocessing:
+        #         print(f"Got key {int(epoch)}, this is not in {self.epoch_best_postprocessing.keys()}, returning the last epoch")
+        #         return self.epoch_best_postprocessing[int(epoch)- 1]
+        #     else:
+        #         return self.epoch_best_postprocessing[int(epoch)]
+        # else:
+        #     postprocessing_confs = list(ParameterGrid(self.postprocessing_grid))
+        #     # There can only be one kind of postprocessing
+        #     assert len(postprocessing_confs) == 1
+        #     return tuple(postprocessing_confs[0].items())
 
 
 
