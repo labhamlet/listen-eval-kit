@@ -11,7 +11,7 @@ TODO:
     * If disk speed is the limiting factor maybe we should train
     many models simultaneously with one disk read?
 """
-
+import os
 import copy
 import json
 import logging
@@ -30,7 +30,7 @@ import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torchinfo
-from intervaltree import IntervalTree
+from intervaltree import Interval, IntervalTree
 
 # import wandb
 from pytorch_lightning import seed_everything
@@ -474,11 +474,10 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         )
         #STARSS23 has 100ms
         self.ref_timestamp_per_second = 10
-        if self.source == "static":
-            self.target_events = {
-                "val": map_to_frames(validation_target_events),
-                "test": map_to_frames(test_target_events),
-            }
+        self.target_events = {
+            "val": validation_target_events,
+            "test": test_target_events,
+        }
         #If source is dynamic or static
         self.source = source
 
@@ -525,11 +524,14 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 timestamp,
                 self.nlabels
             )
+            print(self.target_events[name])
             ref_events = get_accdoa_events(
                 self.target_events[name],             
                 filename,
                 timestamp,
-                self.nlabels
+                self.nlabels,
+                load_from_dict=True,
+                label_to_idx=self.label_to_idx
             )
             #The time-stamp interval that model produces time-stamps
             diff = np.mean(np.diff(np.array(timestamp)))
@@ -951,6 +953,8 @@ def get_accdoa_events(
     filenames: List[str],
     timestamps,
     nb_classes: int, 
+    load_from_dict : bool = False,
+    label_to_idx : Dict[str, int] = None
 ) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
     """
     Produces lists of events from a set of frame based label accdoas.
@@ -984,14 +988,28 @@ def get_accdoa_events(
     """
     # This probably could be more efficient if we make the assumption that
     # timestamps are in sorted order. But this makes sure of it.
-    assert predictions.shape[0] == len(filenames)
     event_files: Dict[str, Dict[int, torch.Tensor]] = {}
     for timestamp_idx, (filename, timestamp) in tqdm(enumerate(zip(filenames, timestamps))):
         slug = Path(filename).name
         if slug not in event_files:
           event_files[slug] = {}
-        # Save the predictions for the file keyed on the timestamp
-        event_files[slug][timestamp] = predictions[timestamp_idx]
+        # Loads from the test/valid folds.
+        if load_from_dict:
+            y = torch.zeros([nb_classes, 3])
+            events = predictions[os.path.basename(filename)][timestamp_idx]
+            if len(events) != 0: #If there is an active event
+              active_classes = []
+              active_doas = []
+              for event in events:
+                print("EVENT is", event)
+                class_str = event[0]
+                doa_tuple = event[1]   
+                class_idx = label_to_idx[str(class_str)]
+                y[class_idx] = torch.tensor(doa_tuple).float()
+            
+            event_files[slug][float(timestamp)] = y
+        else:
+          event_files[slug][float(timestamp)] = predictions[timestamp_idx]
 
     event_dict: Dict[
         Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[float, str]]]]
@@ -1315,28 +1333,29 @@ def map_to_frames(target_events: Dict[str, List[Dict[str, Any]]], timestamps: Di
 
     for file_name in target_events:
         events = target_events[file_name]
+        tree = IntervalTree()
         for event in events:
             tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["direction"]))
         
         labels_for_sound = []
-        for time_stamp in enumerate(timestamps[file_name]):
+        for time_stamp in timestamps[file_name]:
             interval_labels: List[str | Tuple[str, List[float]]] = [interval.data for interval in tree[time_stamp]]
             labels_for_sound.append(interval_labels)
-
-        if file_name not in timestamp_labels:
-            timestamp_labels[file_name] = {}
-
-        timestamp_labels[file_name].append(labels_for_sound)
+        timestamp_labels[file_name] = labels_for_sound
 
     return timestamp_labels
 
 def load_timestamps(embedding_path, metadata, split_name):
+    import os 
     filename_timestamps_json = embedding_path.joinpath(
         f"{split_name}.filename-timestamps.json"
     )
     timestamps_ = {} 
     for filename, timestamps in json.load(open(filename_timestamps_json)):
-        timestamps_[filename] = timestamps
+        filename = os.path.basename(filename)
+        if filename not in timestamps_:
+          timestamps_[filename] = []
+        timestamps_[filename].append(timestamps)
     return timestamps_
 
 
