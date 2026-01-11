@@ -788,7 +788,7 @@ available_scores: Dict[str, Callable] = {
         SELD,
         name="segment_1s_er",
         scores=("SELD", "ER", "F", "LE", "LR"),
-        params= {"nb_classes": 12, "doa_threshold": 20, "average": "macro"}
+        params= {"nb_classes": 10, "doa_threshold": 20, "average": "macro"},
         maximize=True,
     ),
     "mAP": MeanAveragePrecision,
