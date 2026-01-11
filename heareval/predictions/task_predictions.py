@@ -1372,7 +1372,6 @@ def task_predictions_train(
                 conf=conf,
                 use_scoring_for_early_stopping=use_scoring_for_early_stopping,
                 source = metadata["source_dynamics"],
-                postprocessing_grid=postprocessing_grid,
             )
         else:
             predictor = EventPredictionModel(
