@@ -207,7 +207,7 @@ class FullyConnectedPrediction(torch.nn.Module):
             self.activation = torch.nn.Tanh()
             self.logit_loss = torch.nn.MSELoss()
         elif prediction_type == "accdoa":
-            self.activation = torch.nn.Identity()
+            self.activation = torch.nn.Tanh()
             self.logit_loss = torch.nn.MSELoss()
         else:
             raise ValueError(f"Unknown prediction_type {prediction_type}")
@@ -881,11 +881,12 @@ def get_ref_accdoa_events(
     ] = {}
 
     for filename in filenames:
+        filename = os.path.basename(filename)
         # Loads from the test/valid folds.
         # Get the timestamp for the ref_timestamps, and map it into ACCDOA style?
-        assert sorted(ref_timestamps[os.path.basename(filename)]) == ref_timestamps[os.path.basename(filename)], f"Timestamps for {filename} is not sorted!"
-        for timestamp_idx, timestamp in enumerate(ref_timestamps[os.path.basename(filename)]):
-          events = references[os.path.basename(filename)][timestamp_idx]
+        assert sorted(ref_timestamps[filename]) == ref_timestamps[filename], f"Timestamps for {filename} is not sorted!"
+        for timestamp_idx, timestamp in enumerate(ref_timestamps[filename]):
+          events = references[filename][timestamp_idx]
           if len(events) != 0: #If there is an active event
             for event in events:
               class_str = event[0]
@@ -970,7 +971,7 @@ def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
     
     # 1. Handle Input (Dict vs Tensor) & Timestamps
     timestamps = sorted(accdoa_in.keys())
-    predictions_list = [accdoa_in[t] for t in timestamps]
+    predictions_list = [accdoa_in[t].detach().cpu().numpy() for t in timestamps]
     #Predictions per timestamp (actually frame)
     accdoa_vectors = np.stack(predictions_list)
     predictions = {} 
