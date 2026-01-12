@@ -545,7 +545,6 @@ class Top1Accuracy(ScoreFunction):
 
         return correct / len(targets)
 
-
 class ChromaAccuracy(ScoreFunction):
     """
     Score specifically for pitch detection -- converts all pitches to chroma first.
@@ -681,14 +680,8 @@ class SELD(ScoreFunction):
             pred_dict = pred_dicts[file_name]
             ref_dict = ref_dicts[file_name]
             nb_ref_frames = max(list(ref_dict.keys()))
-            print(f"For file: {file_name}, nb_ref_frames is : {nb_ref_frames}")
-            print(f"Pred dict: {pred_dict}")
-            print(f"GT_dict: {ref_dict}")
-            print(f"Nb_label_frames_per_second: {_nb_label_frames_1s}")
             pred_labels = segment_labels(pred_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
             ref_labels = segment_labels(ref_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
-            print(pred_labels)
-            print(ref_labels)
             eval.update_seld_scores(pred_labels, ref_labels)
 
         # Overall SED and DOA scores
@@ -700,8 +693,6 @@ class SELD(ScoreFunction):
         overall_scores["SELD"] = seld_scr
 
         return tuple([(score, float(overall_scores[score])) for score in self.scores])
-
-
 
 class SegmentBasedScore(SoundEventScore):
     """
@@ -1051,7 +1042,7 @@ available_scores: Dict[str, Callable] = {
         name="SELD",
         scores=("SELD", "ER", "F", "LE", "LR"),
         params= {"nb_classes": 8, "doa_threshold": 50, "average": "macro"},
-        maximize=True,
+        maximize=False,
     ),
     "mAP": MeanAveragePrecision,
     "d_prime": DPrime,
