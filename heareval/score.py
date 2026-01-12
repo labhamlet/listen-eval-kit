@@ -652,7 +652,7 @@ class SoundEventScore(ScoreFunction):
                         "file": filename,
                     }
                 )
-        return  (reference_events)
+        return  MetaDataContainer(reference_events)
 
 class SELD(ScoreFunction):
     def __init__(
