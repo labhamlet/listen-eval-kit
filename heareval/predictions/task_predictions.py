@@ -879,7 +879,7 @@ def get_ref_accdoa_events(
                 event_dict[filename] = {}
               if timestamp_idx not in event_dict[filename]:
                 event_dict[filename][timestamp_idx] = []
-              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1]), float(doa_tuple[2]), 0])
+              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1]), float(doa_tuple[2])])
 
     return event_dict
 
@@ -969,7 +969,7 @@ def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
             predictions[time_frame] = [] 
         #For each predicted class, append the class index and float to the predictions
         for class_idx in sed:
-            predictions[time_frame].append([int(class_idx), 0, float(x[class_idx]), float(y[class_idx]), float(z[class_idx]), 0.0])
+            predictions[time_frame].append([int(class_idx), 0, float(x[class_idx]), float(y[class_idx]), float(z[class_idx])])
 
     return predictions, np.mean(np.diff(np.array(timestamps)))
 
