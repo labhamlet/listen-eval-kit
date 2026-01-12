@@ -519,27 +519,15 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             prog_bar=True,
             logger=True,
         )
-        epoch = getattr(self, "inference_epoch", self.current_epoch)
-        if name == "val":
-            postprocessing_cached = None
-        elif name == "test":
-            postprocessing_cached = self.epoch_best_postprocessing_or_default(int(epoch))
-        else:
-            raise ValueError
-
         if name == "test" or self.use_scoring_for_early_stopping:
             #Here we get events for all files per filename.
             #TODO finish mapping this!
-            print("Pred events")
             pred_events, diff = get_accdoa_events(
                 prediction,
                 filename,
                 timestamp,
                 self.nlabels
             )
-            print("Pred_events done.")
-            #Here we can get the events that have been cached for sure!
-            print("Ref events")
             if self.cached:
                 ref_events = self._retrieve_from_cache(
                     name
@@ -554,32 +542,14 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 )
                 self._cache(ref_events, name)
                 self.cached = True
-            print("Ref events done")
-            #The time-stamp interval that model produces time-stamps
             _nb_pred_frames_1s = int(1000 // diff)
             _nb_label_frames_1s = _nb_pred_frames_1s if self.source == "static" else self._nb_label_frames_1s
-
-            primary_score_fn = self.scores[0]
-            print("Scoring")
-            primary_score_ret = primary_score_fn(
-                    pred_events,
+            self.log_scores(
+                name, score_args=(pred_events,
                     ref_events,
-                    _nb_label_frames_1s,
+                    _nb_label_frames_1s
+                    )
             )
-            print("Scoring Done")
-            if isinstance(primary_score_ret, tuple):
-                primary_score = primary_score_ret[0][1]
-            elif isinstance(primary_score_ret, float):
-                primary_score = primary_score_ret
-            else:
-                raise ValueError(
-                    f"Return type {type(primary_score_ret)} is unexpected. "
-                    "Return type of the score function should either be a "
-                    "tuple(tuple) or float. "
-                )
-            if np.isnan(primary_score):
-                primary_score = 0.0
-
             if name == "test":
                 # Cache all predictions for later serialization
                 self.test_predictions = {
@@ -589,13 +559,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                     "predicted_events": pred_events,
                     "timestamp": timestamp,
                 }
-
-            self.log_scores(
-                name, score_args=(pred_events,
-                    ref_events,
-                    _nb_label_frames_1s
-                    )
-            )
         
     def epoch_best_postprocessing_or_default(
         self, epoch: int
