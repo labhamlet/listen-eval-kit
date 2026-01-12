@@ -486,7 +486,13 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         }
         #If source is dynamic or static
         self.source = source
+        self.cache = {}
+        self.cached = False
 
+    def _cache(self, events, name):
+        self.cache[name] = events
+    def _retrieve_from_cache(self, name):
+        return self.cache[name]
 
     def _score_epoch_end(self, name: str, outputs: List[Dict[str, List[Any]]]):
         flat_outputs = self._flatten_batched_outputs(
@@ -530,13 +536,21 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 timestamp,
                 self.nlabels
             )
-            ref_events = get_ref_accdoa_events(
-                self.target_events[name],             
-                filename,
-                self.target_timestamps[name],
-                self.nlabels,
-                label_to_idx=self.label_to_idx
-            )
+            #Here we can get the events that have been cached for sure!
+            if self.cached:
+                ref_events = self._retrieve_from_cache(
+                    name
+                )
+            else:
+                ref_events = get_ref_accdoa_events(
+                    self.target_events[name],             
+                    filename,
+                    self.target_timestamps[name],
+                    self.nlabels,
+                    label_to_idx=self.label_to_idx
+                )
+                self._cache(ref_events, name)
+                self.cached = True
             #The time-stamp interval that model produces time-stamps
             _nb_pred_frames_1s = int(1000 // diff)
             _nb_label_frames_1s = _nb_pred_frames_1s if self.source == "static" else self._nb_label_frames_1s
