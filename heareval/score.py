@@ -1,2092 +1,1077 @@
-#!/usr/bin/env python3
 """
-Map embeddings to predictions for every downstream task and store
-test predictions to disk.
-
-Model selection over the validation score.
-
-TODO:
-    * Profiling should occur here (both embedding time AFTER loading
-    to GPU, and complete wall time include disk writes).
-    * If disk speed is the limiting factor maybe we should train
-    many models simultaneously with one disk read?
+Common utils for scoring.
 """
-import os
-import copy
-import json
-import logging
-import multiprocessing
-import pickle
-import random
-import sys
-import time
-from collections import defaultdict
-from pathlib import Path
-from typing import Any, DefaultDict, Dict, List, Optional, Tuple, Union
 
-import more_itertools
+from collections import ChainMap
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
 import numpy as np
 import pandas as pd
-import pytorch_lightning as pl
+import sed_eval
 import torch
-import torchinfo
-from intervaltree import Interval, IntervalTree
 
-# import wandb
-from pytorch_lightning import seed_everything
-from pytorch_lightning.callbacks.early_stopping import EarlyStopping
-from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
-from pytorch_lightning.loggers import CSVLogger
-from scipy.ndimage import median_filter
-from sklearn.model_selection import ParameterGrid
-from torch.utils.data import ConcatDataset, DataLoader, Dataset
-from tqdm.auto import tqdm
+# Can we get away with not using DCase for every event-based evaluation??
+import dcase_util 
+from dcase_util.containers import MetaDataContainer
+from scipy import stats
+from sklearn.metrics import average_precision_score, roc_auc_score
 
-from heareval.score import (
-    ScoreFunction,
-    available_scores,
-    label_to_binary_vector,
-    label_vocab_as_dict,
-    validate_score_return_type,
-)
-
-TASK_SPECIFIC_PARAM_GRID = {
-    "dcase2016_task2": {
-        # sed_eval is very slow
-        "check_val_every_n_epoch": [10],
-    },
-    "tau2018-ov1": {
-        "check_val_every_n_epoch": [25]
-    },
-    "tau2018-ov2": {
-        "check_val_every_n_epoch": [10],
-    },
-    "tau2018-ov3": {
-        "check_val_every_n_epoch": [25]
-    }
-}
-
-PARAM_GRID = {
-    "hidden_layers": [1, 2],
-    # "hidden_layers": [0, 1, 2],
-    # "hidden_layers": [1, 2, 3],
-    "hidden_dim": [1024],
-    # "hidden_dim": [256, 512, 1024],
-    # "hidden_dim": [1024, 512],
-    # Encourage 0.5
-    "dropout": [0.1],
-    # "dropout": [0.1, 0.5],
-    # "dropout": [0.1, 0.3],
-    # "dropout": [0.1, 0.3, 0.5],
-    # "dropout": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
-    # "dropout": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-    "lr": [3.2e-3, 1e-3, 3.2e-4, 1e-4],
-    # "lr": [3.2e-3, 1e-3, 3.2e-4, 1e-4, 3.2e-5, 1e-5],
-    # "lr": [1e-2, 3.2e-3, 1e-3, 3.2e-4, 1e-4],
-    # "lr": [1e-1, 1e-2, 1e-3, 1e-4, 1e-5],
-    "patience": [20],
-    "max_epochs": [500],
-    # "max_epochs": [500, 1000],
-    "check_val_every_n_epoch": [3],
-    # "check_val_every_n_epoch": [1, 3, 10],
-    "batch_size": [1024],
-    # "batch_size": [1024, 2048],
-    # "batch_size": [256, 512, 1024],
-    # "batch_size": [256, 512, 1024, 2048, 4096, 8192],
-    "hidden_norm": [torch.nn.BatchNorm1d],
-    # "hidden_norm": [torch.nn.Identity, torch.nn.BatchNorm1d, torch.nn.LayerNorm],
-    "norm_after_activation": [False],
-    # "norm_after_activation": [False, True],
-    "embedding_norm": [torch.nn.Identity],
-    # "embedding_norm": [torch.nn.Identity, torch.nn.BatchNorm1d],
-    # "embedding_norm": [torch.nn.Identity, torch.nn.BatchNorm1d, torch.nn.LayerNorm],
-    "initialization": [torch.nn.init.xavier_uniform_, torch.nn.init.xavier_normal_],
-    "optim": [torch.optim.Adam],
-    # "optim": [torch.optim.Adam, torch.optim.SGD],
-}
-
-FAST_PARAM_GRID = copy.deepcopy(PARAM_GRID)
-FAST_PARAM_GRID.update(
-    {
-        "max_epochs": [50],
-        "check_val_every_n_epoch": [3, 10],
-    }
-)
-
-FASTER_PARAM_GRID = copy.deepcopy(PARAM_GRID)
-FASTER_PARAM_GRID.update(
-    {
-        "hidden_layers": [0, 1],
-        "hidden_dim": [64, 128],
-        "patience": [1, 3],
-        "max_epochs": [10],
-        "check_val_every_n_epoch": [1],
-    }
-)
-
-# These are good for dcase, change for other event-based secret tasks
-EVENT_POSTPROCESSING_GRID = {
-    "median_filter_ms": [250, 500],
-    "min_duration": [250, 500],
-    #    "median_filter_ms": [0, 62, 125, 250, 500, 1000],
-    #    "min_duration": [0, 62, 125, 250, 500, 1000],
-}
-
-NUM_WORKERS = int(multiprocessing.cpu_count() / (max(1, torch.cuda.device_count())))
-
-class SetEpochCallback(pl.Callback):
-    def __init__(self, epoch):
-        self.epoch = epoch
-    
-    def on_test_start(self, trainer, pl_module):
-        pl_module._current_epoch = self.epoch
-        print(f"Set epoch to {self.epoch}, model sees: {pl_module.current_epoch}")
-
-class OneHotToCrossEntropyLoss(pl.LightningModule):
-    def __init__(self):
-        super().__init__()
-        self.loss = torch.nn.CrossEntropyLoss()
-
-    def forward(self, y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        # One and only one label per class
-        assert torch.all(
-            torch.sum(y, dim=1) == torch.ones(y.shape[0], device=self.device)
-        )
-        y = y.argmax(dim=1)
-        return self.loss(y_hat, y)
+import math 
+from scipy.optimize import linear_sum_assignment
+from IPython import embed
 
 
-class FullyConnectedPrediction(torch.nn.Module):
-    def __init__(self, nfeatures: int, nlabels: int, prediction_type: str, conf: Dict):
-        super().__init__()
+eps = np.finfo(np.float64).eps
 
-        hidden_modules: List[torch.nn.Module] = []
-        curdim = nfeatures
-        # Honestly, we don't really know what activation preceded
-        # us for the final embedding.
-        last_activation = "linear"
-        if conf["hidden_layers"]:
-            for i in range(conf["hidden_layers"]):
-                linear = torch.nn.Linear(curdim, conf["hidden_dim"])
-                conf["initialization"](
-                    linear.weight,
-                    gain=torch.nn.init.calculate_gain(last_activation),
-                )
-                hidden_modules.append(linear)
-                if not conf["norm_after_activation"]:
-                    hidden_modules.append(conf["hidden_norm"](conf["hidden_dim"]))
-                hidden_modules.append(torch.nn.Dropout(conf["dropout"]))
-                hidden_modules.append(torch.nn.ReLU())
-                last_activation = "relu"
-
-                if conf["norm_after_activation"]:
-                    hidden_modules.append(conf["hidden_norm"](conf["hidden_dim"]))
-                curdim = conf["hidden_dim"]
-
-            self.hidden = torch.nn.Sequential(*hidden_modules)
-        else:
-            self.hidden = torch.nn.Identity()  # type: ignore
-
-        if prediction_type == "accdoa":
-            self.projection = torch.nn.Linear(curdim, 3 * nlabels)
-        else:
-            self.projection = torch.nn.Linear(curdim, nlabels)
-
-        gain = torch.nn.init.calculate_gain(last_activation)
-        conf["initialization"](self.projection.weight, gain=gain)
-        self.logit_loss: torch.nn.Module
-        if prediction_type == "multilabel":
-            self.activation: torch.nn.Module = torch.nn.Sigmoid()
-            self.logit_loss = torch.nn.BCEWithLogitsLoss()
-        elif prediction_type == "multiclass" or (
-            prediction_type == "polar-classification"
-        ):
-            self.activation = torch.nn.Softmax(dim=1)
-            self.logit_loss = OneHotToCrossEntropyLoss()
-        elif "regression" in prediction_type:
-            self.activation = torch.nn.Tanh()
-            self.logit_loss = torch.nn.MSELoss()
-        elif prediction_type == "accdoa":
-            self.activation = torch.nn.Tanh()
-            self.logit_loss = torch.nn.MSELoss()
-        else:
-            raise ValueError(f"Unknown prediction_type {prediction_type}")
-
-    def forward_logit(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.hidden(x)
-        x = self.projection(x)
-        return x
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.forward_logit(x)
-        x = self.activation(x)
-        return x
+def convert_output_format_cartesian_to_polar(in_dict):
+    out_dict = {}
+    for frame_cnt in in_dict.keys():
+        if frame_cnt not in out_dict:
+            out_dict[frame_cnt] = []
+            for tmp_val in in_dict[frame_cnt]:
+                x, y, z = tmp_val[2], tmp_val[3], tmp_val[4]
+                azimuth = np.arctan2(y, x) * 180 / np.pi
+                elevation = np.arctan2(z, np.sqrt(x**2 + y**2)) * 180 / np.pi
+                r = np.sqrt(x**2 + y**2 + z**2)
+                out_dict[frame_cnt].append([tmp_val[0], tmp_val[1], azimuth, elevation])
+    print(out_dict)
+    return out_dict
 
 
-class AbstractPredictionModel(pl.LightningModule):
-    def __init__(
-        self,
-        nfeatures: int,
-        label_to_idx: Dict[str, int],
-        nlabels: int,
-        prediction_type: str,
-        scores: List[ScoreFunction],
-        conf: Dict,
-        use_scoring_for_early_stopping: bool = True,
-        source : str = "static"
-    ):
-        super().__init__()
 
-        self.save_hyperparameters(conf)
-        self.use_scoring_for_early_stopping = use_scoring_for_early_stopping
+class SELDMetrics(object):
+    def __init__(self, doa_threshold=20, nb_classes=11, average='macro'):
+        '''
+            This class implements both the class-sensitive localization and location-sensitive detection metrics.
+            Additionally, based on the user input, the corresponding averaging is performed within the segment.
 
-        # Since we don't know how these embeddings are scaled
-        self.layernorm = conf["embedding_norm"](nfeatures)
-        self.predictor = FullyConnectedPrediction(
-            nfeatures, nlabels, prediction_type, conf
-        )
-        torchinfo.summary(self.predictor, input_size=(64, nfeatures))
-        self.label_to_idx = label_to_idx
-        self.idx_to_label: Dict[int, str] = {
-            idx: label for (label, idx) in self.label_to_idx.items()
-        }
-        self.scores = scores
-        self.prediction_type = prediction_type
-        self.nlabels = nlabels
-        self.source = source
+        :param nb_classes: Number of sound classes. In the paper, nb_classes = 11
+        :param doa_thresh: DOA threshold for location sensitive detection.
+        '''
+        self._nb_classes = nb_classes
 
-    def forward(self, x):
-        # x = self.layernorm(x)
-        x = self.predictor(x)
-        return x
+        # Variables for Location-senstive detection performance
+        self._TP = np.zeros(self._nb_classes)
+        self._FP = np.zeros(self._nb_classes)
+        self._FP_spatial = np.zeros(self._nb_classes)
+        self._FN = np.zeros(self._nb_classes)
 
-    def training_step(self, batch, batch_idx):
-        # training_step defined the train loop.
-        # It is independent of forward
-        x, y, _ = batch
-        y_hat = self.predictor.forward_logit(x)
-        if self.prediction_type == "accdoa" or ("regression" in self.prediction_type):
-            y_hat = self.predictor.activation(y_hat)
-            if self.prediction_type == "accdoa":
-                y_hat = y_hat.view(y.shape[0], self.nlabels, 3)
+        self._Nref = np.zeros(self._nb_classes)
 
-        loss = self.predictor.logit_loss(y_hat, y)
-        # Logging to TensorBoard by default
-        self.log("train_loss", loss)
-        return loss
+        self._spatial_T = doa_threshold
 
-    def _step(self, batch, batch_idx):
-        # -> Dict[str, Union[torch.Tensor, List(str)]]:
-        x, y, metadata = batch
-        y_hat = self.predictor.forward_logit(x)
-        y_pr = self.predictor(x)
+        self._S = 0
+        self._D = 0
+        self._I = 0
 
-        z = None
-        if self.prediction_type == "accdoa":
-            y_pr = y_pr.view(y.shape[0], self.nlabels, 3)
-            z = {
-                "prediction": y_pr,
-                "target": y,
-            }
-        
-        elif "regression" in self.prediction_type:
-            z = {
-                "prediction": y_pr,
-                "prediction_logit": y_pr,
-                "target": y,
-            }
-        else:
-            z = {
-                "prediction": y_pr,
-                "prediction_logit": y_hat,
-                "target": y,
-            }
-        # https://stackoverflow.com/questions/38987/how-do-i-merge-two-dictionaries-in-a-single-expression-taking-union-of-dictiona
-        return {**z, **metadata}
+        # Variables for Class-sensitive localization performance
+        self._total_DE = np.zeros(self._nb_classes)
 
-    def validation_step(self, batch, batch_idx):
-        return self._step(batch, batch_idx)
+        self._DE_TP = np.zeros(self._nb_classes)
+        self._DE_FP = np.zeros(self._nb_classes)
+        self._DE_FN = np.zeros(self._nb_classes)
 
-    def test_step(self, batch, batch_idx):
-        return self._step(batch, batch_idx)
+        self._average = average
 
-    def log_scores(self, name: str, score_args):
-        """Logs the metric score value for each score defined for the model"""
-        assert hasattr(self, "scores"), "Scores for the model should be defined"
-        end_scores = {}
-        # The first score in the first `self.scores` is the optimization criterion
-        for score in self.scores:
-            score_ret = score(*score_args)
-            validate_score_return_type(score_ret)
-            # If the returned score is a tuple, store each subscore as separate entry
-            if isinstance(score_ret, tuple):
-                end_scores[f"{name}_{score}"] = score_ret[0][1]
-                # All other scores will also be logged
-                for subscore, value in score_ret:
-                    end_scores[f"{name}_{score}_{subscore}"] = value
-            elif isinstance(score_ret, float):
-                end_scores[f"{name}_{score}"] = score_ret
-            else:
-                raise ValueError(
-                    f"Return type {type(score_ret)} is unexpected. Return type of "
-                    "the score function should either be a "
-                    "tuple(tuple) or float."
-                )
-
-        self.log(
-            f"{name}_score", end_scores[f"{name}_{str(self.scores[0])}"], logger=True
-        )
-        for score_name in end_scores:
-            self.log(score_name, end_scores[score_name], prog_bar=True, logger=True)
-
-    # Implement this for each inheriting class
-    # TODO: Can we combine the boilerplate for both of these?
-    def _score_epoch_end(self, name: str, outputs: List[Dict[str, List[Any]]]):
+    def early_stopping_metric(self, _er, _f, _le, _lr):
         """
-        Return at the end of every validation and test epoch.
-        :param name: "val" or "test"
-        :param outputs: Unflattened minibatches from {name}_step,
-            each with "target", "prediction", and additional metadata,
-            with a list of values for each instance in the batch.
-        :return:
+        Compute early stopping metric from sed and doa errors.
+
+        :param sed_error: [error rate (0 to 1 range), f score (0 to 1 range)]
+        :param doa_error: [doa error (in degrees), frame recall (0 to 1 range)]
+        :return: early stopping metric result
         """
-        raise NotImplementedError("Implement this in children")
+        seld_metric = np.mean([
+            _er,
+            1 - _f,
+            _le / 180,
+            1 - _lr
+        ], 0)
+        return seld_metric
 
-    def validation_epoch_end(self, outputs: List[Dict[str, List[Any]]]):
-        self._score_epoch_end("val", outputs)
+    def compute_seld_scores(self):
+        '''
+        Collect the final SELD scores
 
-    def test_epoch_end(self, outputs: List[Dict[str, List[Any]]]):
-        self._score_epoch_end("test", outputs)
+        :return: returns both location-sensitive detection scores and class-sensitive localization scores
+        '''
+        ER = (self._S + self._D + self._I) / (self._Nref.sum() + eps)
+        classwise_results = []
+        if self._average == 'micro':
+            # Location-sensitive detection performance
+            F = self._TP.sum() / (eps + self._TP.sum() + self._FP_spatial.sum() + 0.5 * (self._FP.sum() + self._FN.sum()))
 
-    def _flatten_batched_outputs(
-        self,
-        outputs,  #: Union[torch.Tensor, List[str]],
-        keys: List[str],
-        dont_stack: List[str] = [],
-    ) -> Dict:
-        # ) -> Dict[str, Union[torch.Tensor, List[str]]]:
-        flat_outputs_default: DefaultDict = defaultdict(list)
-        for output in outputs:
-            assert set(output.keys()) == set(keys), f"{output.keys()} != {keys}"
-            for key in keys:
-                flat_outputs_default[key] += output[key]
-        flat_outputs = dict(flat_outputs_default)
-        for key in keys:
-            if key in dont_stack:
+            # Class-sensitive localization performance
+            LE = self._total_DE.sum() / float(self._DE_TP.sum() + eps) if self._DE_TP.sum() else 180
+            LR = self._DE_TP.sum() / (eps + self._DE_TP.sum() + self._DE_FN.sum())
+
+            SELD_scr = self.early_stopping_metric(ER, F, LE, LR)
+
+        elif self._average == 'macro':
+            # Location-sensitive detection performance
+            F = self._TP / (eps + self._TP + self._FP_spatial + 0.5 * (self._FP + self._FN))
+
+            # Class-sensitive localization performance
+            LE = self._total_DE / (self._DE_TP + eps)
+            LE[self._DE_TP==0] = 180.0
+            LR = self._DE_TP / (eps + self._DE_TP + self._DE_FN)
+
+            SELD_scr = self.early_stopping_metric(np.repeat(ER, self._nb_classes), F, LE, LR)
+            classwise_results = np.array([np.repeat(ER, self._nb_classes), F, LE, LR, SELD_scr])
+            F, LE, LR, SELD_scr = F.mean(), LE.mean(), LR.mean(), SELD_scr.mean()
+        return ER, F, LE, LR, SELD_scr, classwise_results
+
+    def update_seld_scores(self, pred, gt):
+        '''
+        Implements the spatial error averaging according to equation 5 in the paper [1] (see papers in the title of the code).
+        Adds the multitrack extensions proposed in paper [2]
+
+        The input pred/gt can either both be Cartesian or Degrees
+
+        :param pred: dictionary containing class-wise prediction results for each N-seconds segment block
+        :param gt: dictionary containing class-wise groundtruth for each N-seconds segment block
+        '''
+        for block_cnt in range(len(gt.keys())):
+            loc_FN, loc_FP = 0, 0
+            for class_cnt in range(self._nb_classes):
+                # Counting the number of referece tracks for each class in the segment
+                nb_gt_doas = max([len(val) for val in gt[block_cnt][class_cnt][0][1]]) if class_cnt in gt[block_cnt] else None
+                nb_pred_doas = max([len(val) for val in pred[block_cnt][class_cnt][0][1]]) if class_cnt in pred[block_cnt] else None
+                if nb_gt_doas is not None:
+                    self._Nref[class_cnt] += nb_gt_doas
+                if class_cnt in gt[block_cnt] and class_cnt in pred[block_cnt]:
+                    # True positives or False positive case
+
+                    # NOTE: For multiple tracks per class, associate the predicted DOAs to corresponding reference
+                    # DOA-tracks using hungarian algorithm and then compute the average spatial distance between
+                    # the associated reference-predicted tracks.
+
+                    # Reference and predicted track matching
+                    matched_track_dist = {}
+                    matched_track_cnt = {}
+                    gt_ind_list = gt[block_cnt][class_cnt][0][0]
+                    pred_ind_list = pred[block_cnt][class_cnt][0][0]
+                    for gt_ind, gt_val in enumerate(gt_ind_list):
+                        if gt_val in pred_ind_list:
+                            gt_arr = np.array(gt[block_cnt][class_cnt][0][1][gt_ind])
+                            gt_ids = np.arange(len(gt_arr[:, -1])) #TODO if the reference has track IDS use here - gt_arr[:, -1]
+                            gt_doas = gt_arr[:, 1:]
+
+                            pred_ind = pred_ind_list.index(gt_val)
+                            pred_arr = np.array(pred[block_cnt][class_cnt][0][1][pred_ind])
+                            pred_doas = pred_arr[:, 1:]
+
+                            if gt_doas.shape[-1] == 2: # convert DOAs to radians, if the input is in degrees
+                                gt_doas = gt_doas * np.pi / 180.
+                                pred_doas = pred_doas * np.pi / 180.
+
+                            dist_list, row_inds, col_inds = least_distance_between_gt_pred(gt_doas, pred_doas)
+
+                            # Collect the frame-wise distance between matched ref-pred DOA pairs
+                            for dist_cnt, dist_val in enumerate(dist_list):
+                                matched_gt_track = gt_ids[row_inds[dist_cnt]]
+                                if matched_gt_track not in matched_track_dist:
+                                    matched_track_dist[matched_gt_track], matched_track_cnt[matched_gt_track] = [], []
+                                matched_track_dist[matched_gt_track].append(dist_val)
+                                matched_track_cnt[matched_gt_track].append(pred_ind)
+
+                    # Update evaluation metrics based on the distance between ref-pred tracks
+                    if len(matched_track_dist) == 0:
+                        # if no tracks are found. This occurs when the predicted DOAs are not aligned frame-wise to the reference DOAs
+                        loc_FN += nb_pred_doas
+                        self._FN[class_cnt] += nb_pred_doas
+                        self._DE_FN[class_cnt] += nb_pred_doas
+                    else:
+                        # for the associated ref-pred tracks compute the metrics
+                        for track_id in matched_track_dist:
+                            total_spatial_dist = sum(matched_track_dist[track_id])
+                            total_framewise_matching_doa = len(matched_track_cnt[track_id])
+                            avg_spatial_dist = total_spatial_dist / total_framewise_matching_doa
+
+                            # Class-sensitive localization performance
+                            self._total_DE[class_cnt] += avg_spatial_dist
+                            self._DE_TP[class_cnt] += 1
+
+                            # Location-sensitive detection performance
+                            if avg_spatial_dist <= self._spatial_T:
+                                self._TP[class_cnt] += 1
+                            else:
+                                loc_FP += 1
+                                self._FP_spatial[class_cnt] += 1
+                        # in the multi-instance of same class scenario, if the number of predicted tracks are greater
+                        # than reference tracks count as FP, if it less than reference count as FN
+                        if nb_pred_doas > nb_gt_doas:
+                            # False positive
+                            loc_FP += (nb_pred_doas-nb_gt_doas)
+                            self._FP[class_cnt] += (nb_pred_doas-nb_gt_doas)
+                            self._DE_FP[class_cnt] += (nb_pred_doas-nb_gt_doas)
+                        elif nb_pred_doas < nb_gt_doas:
+                            # False negative
+                            loc_FN += (nb_gt_doas-nb_pred_doas)
+                            self._FN[class_cnt] += (nb_gt_doas-nb_pred_doas)
+                            self._DE_FN[class_cnt] += (nb_gt_doas-nb_pred_doas)
+                elif class_cnt in gt[block_cnt] and class_cnt not in pred[block_cnt]:
+                    # False negative
+                    loc_FN += nb_gt_doas
+                    self._FN[class_cnt] += nb_gt_doas
+                    self._DE_FN[class_cnt] += nb_gt_doas
+                elif class_cnt not in gt[block_cnt] and class_cnt in pred[block_cnt]:
+                    # False positive
+                    loc_FP += nb_pred_doas
+                    self._FP[class_cnt] += nb_pred_doas
+                    self._DE_FP[class_cnt] += nb_pred_doas
+
+            self._S += np.minimum(loc_FP, loc_FN)
+            self._D += np.maximum(0, loc_FN - loc_FP)
+            self._I += np.maximum(0, loc_FP - loc_FN)
+        return
+
+
+def distance_between_spherical_coordinates_rad(az1, ele1, az2, ele2):
+    """
+    Angular distance between two spherical coordinates
+    MORE: https://en.wikipedia.org/wiki/Great-circle_distance
+
+    :return: angular distance in degrees
+    """
+    dist = np.sin(ele1) * np.sin(ele2) + np.cos(ele1) * np.cos(ele2) * np.cos(np.abs(az1 - az2))
+    # Making sure the dist values are in -1 to 1 range, else np.arccos kills the job
+    dist = np.clip(dist, -1, 1)
+    dist = np.arccos(dist) * 180 / np.pi
+    return dist
+
+
+def distance_between_cartesian_coordinates(x1, y1, z1, x2, y2, z2):
+    """
+    Angular distance between two cartesian coordinates
+    MORE: https://en.wikipedia.org/wiki/Great-circle_distance
+    Check 'From chord length' section
+
+    :return: angular distance in degrees
+    """
+    # Normalize the Cartesian vectors
+    N1 = np.sqrt(x1**2 + y1**2 + z1**2 + 1e-10)
+    N2 = np.sqrt(x2**2 + y2**2 + z2**2 + 1e-10)
+    x1, y1, z1, x2, y2, z2 = x1/N1, y1/N1, z1/N1, x2/N2, y2/N2, z2/N2
+
+    #Compute the distance
+    dist = x1*x2 + y1*y2 + z1*z2
+    dist = np.clip(dist, -1, 1)
+    dist = np.arccos(dist) * 180 / np.pi
+    return dist
+
+
+def least_distance_between_gt_pred(gt_list, pred_list):
+    """
+        Shortest distance between two sets of DOA coordinates. Given a set of groundtruth coordinates,
+        and its respective predicted coordinates, we calculate the distance between each of the
+        coordinate pairs resulting in a matrix of distances, where one axis represents the number of groundtruth
+        coordinates and the other the predicted coordinates. The number of estimated peaks need not be the same as in
+        groundtruth, thus the distance matrix is not always a square matrix. We use the hungarian algorithm to find the
+        least cost in this distance matrix.
+        :param gt_list_xyz: list of ground-truth Cartesian or Polar coordinates in Radians
+        :param pred_list_xyz: list of predicted Carteisan or Polar coordinates in Radians
+        :return: cost - distance
+        :return: less - number of DOA's missed
+        :return: extra - number of DOA's over-estimated
+    """
+
+    gt_len, pred_len = gt_list.shape[0], pred_list.shape[0]
+    ind_pairs = np.array([[x, y] for y in range(pred_len) for x in range(gt_len)])
+    cost_mat = np.zeros((gt_len, pred_len))
+
+    if gt_len and pred_len:
+        if len(gt_list[0]) == 3: #Cartesian
+            x1, y1, z1, x2, y2, z2 = gt_list[ind_pairs[:, 0], 0], gt_list[ind_pairs[:, 0], 1], gt_list[ind_pairs[:, 0], 2], pred_list[ind_pairs[:, 1], 0], pred_list[ind_pairs[:, 1], 1], pred_list[ind_pairs[:, 1], 2]
+            cost_mat[ind_pairs[:, 0], ind_pairs[:, 1]] = distance_between_cartesian_coordinates(x1, y1, z1, x2, y2, z2)
+        else:
+            az1, ele1, az2, ele2 = gt_list[ind_pairs[:, 0], 0], gt_list[ind_pairs[:, 0], 1], pred_list[ind_pairs[:, 1], 0], pred_list[ind_pairs[:, 1], 1]
+            cost_mat[ind_pairs[:, 0], ind_pairs[:, 1]] = distance_between_spherical_coordinates_rad(az1, ele1, az2, ele2)
+
+    row_ind, col_ind = linear_sum_assignment(cost_mat)
+    cost = cost_mat[row_ind, col_ind]
+    return cost, row_ind, col_ind
+
+  
+def segment_labels(_pred_dict, _max_frames, _nb_label_frames_1s):
+    '''
+        Collects class-wise sound event location information in segments of length 1s from reference dataset
+    :param _pred_dict: Dictionary containing frame-wise sound event time and location information. Output of SELD method
+    :param _max_frames: Total number of frames in the recording
+    :return: Dictionary containing class-wise sound event location information in each segment of audio
+            dictionary_name[segment-index][class-index] = list(frame-cnt-within-segment, azimuth, elevation)
+    '''
+    nb_blocks = int(np.ceil(_max_frames/float(_nb_label_frames_1s)))
+    output_dict = {x: {} for x in range(nb_blocks)}
+    for frame_cnt in range(0, _max_frames, _nb_label_frames_1s):
+
+        # Collect class-wise information for each block
+        # [class][frame] = <list of doa values>
+        # Data structure supports multi-instance occurence of same class
+        block_cnt = frame_cnt // _nb_label_frames_1s
+        loc_dict = {}
+        for audio_frame in range(frame_cnt, frame_cnt+_nb_label_frames_1s):
+            if audio_frame not in _pred_dict:
                 continue
-            else:
-                flat_outputs[key] = torch.stack(flat_outputs[key])
-        return flat_outputs
+            for value in _pred_dict[audio_frame]:
+                if value[0] not in loc_dict:
+                    loc_dict[value[0]] = {}
 
-    def configure_optimizers(self):
-        optimizer = self.hparams.optim(self.parameters(), lr=self.hparams.lr)
-        return optimizer
+                block_frame = audio_frame - frame_cnt
+                if block_frame not in loc_dict[value[0]]:
+                    loc_dict[value[0]][block_frame] = []
+                loc_dict[value[0]][block_frame].append(value[1:])
+
+        # Update the block wise details collected above in a global structure
+        for class_cnt in loc_dict:
+            if class_cnt not in output_dict[block_cnt]:
+                output_dict[block_cnt][class_cnt] = []
+
+            keys = [k for k in loc_dict[class_cnt]]
+            values = [loc_dict[class_cnt][k] for k in loc_dict[class_cnt]]
+
+            output_dict[block_cnt][class_cnt].append([keys, values])
+
+    return output_dict
 
 
-class ScenePredictionModel(AbstractPredictionModel):
+def match_event_roll_lengths_doa(event_roll_a, event_roll_b, length=None):
+    """Fix the length of two event rolls (supports 2D and 3D/DOA arrays).
+
+    Parameters
+    ----------
+    event_roll_a: np.ndarray, shape=(m1, k) or (m1, k, 3)
+        Event roll A
+    event_roll_b: np.ndarray, shape=(m2, k) or (m2, k, 3)
+        Event roll B
+    length: int, optional
+        Length of the event roll. If None, shorter event roll is padded to match longer one.
+
+    Returns
+    -------
+    event_roll_a: np.ndarray
+        Padded/Cropped event roll A
+    event_roll_b: np.ndarray
+        Padded/Cropped event roll B
     """
-    Prediction model with simple scoring over entire audio scenes.
-    """
-
-    def __init__(
-        self,
-        nfeatures: int,
-        label_to_idx: Dict[str, int],
-        nlabels: int,
-        prediction_type: str,
-        scores: List[ScoreFunction],
-        conf: Dict,
-        use_scoring_for_early_stopping: bool = True,
-    ):
-        super().__init__(
-            nfeatures=nfeatures,
-            label_to_idx=label_to_idx,
-            nlabels=nlabels,
-            prediction_type=prediction_type,
-            scores=scores,
-            conf=conf,
-            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-        )
-
-    def _score_epoch_end(self, name: str, outputs: List[Dict[str, List[Any]]]):
-        flat_outputs = self._flatten_batched_outputs(
-            outputs, keys=["target", "prediction", "prediction_logit"]
-        )
-        target, prediction, prediction_logit = (
-            flat_outputs[key] for key in ["target", "prediction", "prediction_logit"]
-        )
-
-        self.log(
-            f"{name}_loss",
-            self.predictor.logit_loss(prediction_logit, target),
-            prog_bar=True,
-            logger=True,
-        )
-
-        if name == "test":
-            # Cache all predictions for later serialization
-            self.test_predictions = {
-                "target": target.detach().cpu(),
-                "prediction": prediction.detach().cpu(),
-                "prediction_logit": prediction_logit.detach().cpu(),
-            }
-
-        if name == "test" or self.use_scoring_for_early_stopping:
-            self.log_scores(
-                name,
-                score_args=(
-                    prediction.detach().cpu().numpy(),
-                    target.detach().cpu().numpy(),
-                ),
-            )
+    
+    def pad_event_roll(event_roll, target_length):
+        current_length = event_roll.shape[0]
+        if target_length > current_length:
+            padding_length = target_length - current_length
             
-class ACCDOAPredictionModel(AbstractPredictionModel):
+            # construct shape to support both 2D (SED) and 3D (DOA)
+            pad_shape = list(event_roll.shape)
+            pad_shape[0] = padding_length
+            
+            padding = np.zeros(tuple(pad_shape))
+            event_roll = np.vstack((event_roll, padding))
+        return event_roll
+
+    # Fix durations of both event_rolls to be equal
+    if length is None:
+        length = max(event_roll_b.shape[0], event_roll_a.shape[0])
+    else:
+        length = int(length)
+
+    if length < event_roll_a.shape[0]:
+        event_roll_a = event_roll_a[0:length, ...]
+    else:
+        event_roll_a = pad_event_roll(event_roll_a, length)
+
+    # Handle Event Roll B
+    if length < event_roll_b.shape[0]:
+        event_roll_b = event_roll_b[0:length, ...]
+    else:
+        event_roll_b = pad_event_roll(event_roll_b, length)
+
+    return event_roll_a, event_roll_b
+
+
+def cart2sph(x, y, z):
     """
-    ACCDOA prediction model. For validation (and test),
-    we combine timestamp events that are adjacent,
-    but discard ones that are too short. We also do not use any post-processing step. 
-    Maybe it is possible to use post-processing for only the sound event detection part.
-    Let's get it without it first.
+    Convert Cartesian coordinates to spherical coordinates.
+    Returns: azimuth, elevation, radius
+    """
+    XsqPlusYsq = x ** 2 + y ** 2
+    r = np.sqrt(XsqPlusYsq + z ** 2)               # r
+    elev = np.arctan2(z, np.sqrt(XsqPlusYsq))      # theta (elevation)
+    az = np.arctan2(y, x)                          # phi (azimuth)
+    return az, elev, r
+
+
+def cartesian_to_spherical(x, y, z):
+    """
+    Convert Cartesian coordinates to spherical coordinates using elevation angle.
+
+    Parameters:
+    x, y, z: Cartesian coordinates
+
+    Returns:
+    tuple(float, float, float): (r, azimuth, elevation)
+    where:
+    - azimuth: angle in the x-y plane (0° to 360°)
+    - elevation: angle from the x-y plane (-90° to 90°)
     """
 
+    # Calculate radial distance
+    # Calculate azimuth angle in x-y plane
+    azimuth = np.radians(np.rad2deg(np.arctan2(x, y)) + 360) % 360
+    elevation = np.atan(z / np.sqrt(x**2 + y**2))
+    return azimuth, elevation
+
+
+def label_vocab_as_dict(df: pd.DataFrame, key: str, value: str) -> Dict:
+    """
+    Returns a dictionary of the label vocabulary mapping the label column to
+    the idx column. key sets whether the label or idx is the key in the dict. The
+    other column will be the value.
+    """
+    if key == "label":
+        # Make sure the key is a string
+        df["label"] = df["label"].astype(str)
+        value = "idx"
+    else:
+        assert key == "idx", "key argument must be either 'label' or 'idx'"
+        value = "label"
+    return df.set_index(key).to_dict()[value]
+
+
+def label_to_binary_vector(label: List, num_labels: int) -> torch.Tensor:
+    """
+    Converts a list of labels into a binary vector
+    Args:
+        label: list of integer labels
+        num_labels: total number of labels
+
+    Returns:
+        A float Tensor that is multi-hot binary vector
+    """
+    # Lame special case for multilabel with no labels
+    if len(label) == 0:
+        # BCEWithLogitsLoss wants float not long targets
+        binary_labels = torch.zeros((num_labels,), dtype=torch.float)
+    else:
+        binary_labels = torch.zeros((num_labels,)).scatter(0, torch.tensor(label), 1.0)
+
+    # Validate the binary vector we just created
+    assert set(torch.where(binary_labels == 1.0)[0].numpy()) == set(label)
+    return binary_labels
+
+
+def validate_score_return_type(ret: Union[Tuple[Tuple[str, float], ...], float]):
+    """
+    Valid return types for the metric are
+        - tuple(tuple(string: name of the subtype, float: the value)): This is the
+            case with sed eval metrics. They can return (("f_measure", value),
+            ("precision", value), ...), depending on the scores
+            the metric should is supposed to return. This is set as `scores`
+            attribute in the metric.
+        - float: Standard metric behaviour
+
+    The downstream prediction pipeline is able to handle these two types.
+    In case of the tuple return type, the value of the first entry in the
+    tuple will be used as an optimisation criterion wherever required.
+    For instance, if the return is (("f_measure", value), ("precision", value)),
+    the value corresponding to the f_measure will be used ( for instance in
+    early stopping if this metric is the primary score for the task )
+    """
+    if isinstance(ret, tuple):
+        assert all(
+            type(s) == tuple and type(s[0]) == str and type(s[1]) == float for s in ret
+        ), (
+            "If the return type of the score is a tuple, all the elements "
+            "in the tuple should be tuple of type (string, float)"
+        )
+    elif isinstance(ret, float):
+        pass
+    else:
+        raise ValueError(
+            f"Return type {type(ret)} is unexpected. Return type of "
+            "the score function should either be a "
+            "tuple(tuple) or float. "
+        )
+
+
+class ScoreFunction:
+    """
+    A simple abstract base class for score functions
+    """
+
+    # TODO: Remove label_to_idx?
     def __init__(
         self,
-        nfeatures: int,
         label_to_idx: Dict[str, int],
-        nlabels: int,
-        prediction_type: str,
-        scores: List[ScoreFunction],
-        validation_target_events: Dict[str, List[Dict[str, Any]]],
-        test_target_events: Dict[str, List[Dict[str, Any]]],
-        validation_target_timestamps: Dict[str, List[float]],
-        test_target_timestamps: Dict[str, List[float]],
-        conf: Dict,
-        use_scoring_for_early_stopping: bool = True,
-        source : str = 'static'
+        name: Optional[str] = None,
+        maximize: bool = True,
     ):
-        super().__init__(
-            nfeatures=nfeatures,
-            label_to_idx=label_to_idx,
-            nlabels=nlabels,
-            prediction_type=prediction_type,
-            scores=scores,
-            conf=conf,
-            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-            source = source
-        )
-        #STARSS23 has 100ms
-        self.ref_timestamp_per_second = 10
-        self.target_events = {
-            "val": validation_target_events,
-            "test": test_target_events,
-        }
-        self.target_timestamps = {
-            "val": validation_target_timestamps,
-            "test": test_target_timestamps,
-        }
-        #If source is dynamic or static
-        self.source = source
-        self.cache = {}
-        self.cached = False
-
-    def _cache(self, events, name):
-        self.cache[name] = events
-    def _retrieve_from_cache(self, name):
-        return self.cache[name]
-
-    def _score_epoch_end(self, name: str, outputs: List[Dict[str, List[Any]]]):
-        flat_outputs = self._flatten_batched_outputs(
-            outputs,
-            keys=["target", "prediction", "filename", "timestamp"],
-            # This is a list of string, not tensor, so we don't need to stack it
-            dont_stack=["filename"],
-        )
-        #Get the target and predictions.
-        #Later we need to post process them.
-        target, prediction, filename, timestamp = (
-            flat_outputs[key]
-            for key in [
-                "target",
-                "prediction",
-                "filename",
-                "timestamp",
-            ]
-        )
-
-        self.log(
-            f"{name}_loss",
-            self.predictor.logit_loss(prediction, target),
-            prog_bar=True,
-            logger=True,
-        )
-        if name == "test" or self.use_scoring_for_early_stopping:
-            #Here we get events for all files per filename.
-            #TODO finish mapping this!
-            pred_events, diff = get_accdoa_events(
-                prediction,
-                filename,
-                timestamp,
-                self.nlabels
-            )
-            if self.cached:
-                ref_events = self._retrieve_from_cache(
-                    name
-                )
-            else:
-                ref_events = get_ref_accdoa_events(
-                    self.target_events[name],             
-                    filename,
-                    self.target_timestamps[name],
-                    self.nlabels,
-                    label_to_idx=self.label_to_idx
-                )
-                self._cache(ref_events, name)
-                self.cached = True
-            _nb_pred_frames_1s = int(1000 // diff)
-            _nb_label_frames_1s = _nb_pred_frames_1s if self.source == "static" else self._nb_label_frames_1s
-            self.log_scores(
-                name, score_args=(pred_events,
-                    ref_events,
-                    _nb_label_frames_1s
-                    )
-            )
-            if name == "test":
-                # Cache all predictions for later serialization
-                self.test_predictions = {
-                    "target": target.detach().cpu(),
-                    "prediction": prediction.detach().cpu(),
-                    "target_events": self.target_events[name],
-                    "predicted_events": pred_events,
-                    "timestamp": timestamp,
-                }
-        
-    def epoch_best_postprocessing_or_default(
-        self, epoch: int
-    ) -> Tuple[Tuple[str, Any], ...]:
-        return None
-
-
-class EventPredictionModel(AbstractPredictionModel):
-    """
-    Event prediction model. For validation (and test),
-    we combine timestamp events that are adjacent,
-    but discard ones that are too short.
-    """
-
-    def __init__(
-        self,
-        nfeatures: int,
-        label_to_idx: Dict[str, int],
-        nlabels: int,
-        prediction_type: str,
-        scores: List[ScoreFunction],
-        validation_target_events: Dict[str, List[Dict[str, Any]]],
-        test_target_events: Dict[str, List[Dict[str, Any]]],
-        postprocessing_grid: Dict[str, List[float]],
-        conf: Dict,
-        use_scoring_for_early_stopping: bool = True,
-    ):
-        super().__init__(
-            nfeatures=nfeatures,
-            label_to_idx=label_to_idx,
-            nlabels=nlabels,
-            prediction_type=prediction_type,
-            scores=scores,
-            conf=conf,
-            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-        )
-        self.target_events = {
-            "val": validation_target_events,
-            "test": test_target_events,
-        }
-        # For each epoch, what postprocessing parameters were best
-        self.epoch_best_postprocessing: Dict[int, Tuple[Tuple[str, Any], ...]] = {}
-        self.postprocessing_grid = postprocessing_grid
-
-    def epoch_best_postprocessing_or_default(
-        self, epoch: int
-    ) -> Tuple[Tuple[str, Any], ...]:
-        if self.use_scoring_for_early_stopping:
-            try:
-                return self.epoch_best_postprocessing[epoch]
-            except KeyError:
-                print("Got key erorr with epoch number : {k} using the last epoch")
-                return self.epoch_best_postprocessing[epoch - 1]
-        else:
-            postprocessing_confs = list(ParameterGrid(self.postprocessing_grid))
-            # There can only be one kind of postprocessing
-            assert len(postprocessing_confs) == 1
-            return tuple(postprocessing_confs[0].items())
-
-    def _score_epoch_end(self, name: str, outputs: List[Dict[str, List[Any]]]):
-        flat_outputs = self._flatten_batched_outputs(
-            outputs,
-            keys=["target", "prediction", "prediction_logit", "filename", "timestamp"],
-            # This is a list of string, not tensor, so we don't need to stack it
-            dont_stack=["filename"],
-        )
-        target, prediction, prediction_logit, filename, timestamp = (
-            flat_outputs[key]
-            for key in [
-                "target",
-                "prediction",
-                "prediction_logit",
-                "filename",
-                "timestamp",
-            ]
-        )
-
-        self.log(
-            f"{name}_loss",
-            self.predictor.logit_loss(prediction_logit, target),
-            prog_bar=True,
-            logger=True,
-        )
-
-        epoch = getattr(self, "inference_epoch", self.current_epoch)
-        if name == "val":
-            postprocessing_cached = None
-        elif name == "test":
-            postprocessing_cached = self.epoch_best_postprocessing_or_default(epoch)
-        else:
-            raise ValueError
-        # print("\n\n\n", epoch)
-
-        if name == "test" or self.use_scoring_for_early_stopping:
-            predicted_events_by_postprocessing = get_events_for_all_files(
-                prediction,
-                filename,
-                timestamp,
-                self.idx_to_label,
-                self.postprocessing_grid,
-                postprocessing_cached,
-            )
-
-            score_and_postprocessing = []
-            for postprocessing in tqdm(predicted_events_by_postprocessing):
-                print("post processing")
-                predicted_events = predicted_events_by_postprocessing[postprocessing]
-                primary_score_fn = self.scores[0]
-                primary_score_ret = primary_score_fn(
-                    # predicted_events, self.target_events[name]
-                    predicted_events,
-                    self.target_events[name],
-                )
-                print("primary is done")
-                # If the score returns a tuple of scores, the first score
-                # is used
-                if isinstance(primary_score_ret, tuple):
-                    primary_score = primary_score_ret[0][1]
-                elif isinstance(primary_score_ret, float):
-                    primary_score = primary_score_ret
-                else:
-                    raise ValueError(
-                        f"Return type {type(primary_score_ret)} is unexpected. "
-                        "Return type of the score function should either be a "
-                        "tuple(tuple) or float. "
-                    )
-                if np.isnan(primary_score):
-                    primary_score = 0.0
-                score_and_postprocessing.append((primary_score, postprocessing))
-            score_and_postprocessing.sort(reverse=True)
-
-            # for vs in score_and_postprocessing:
-            #    print(vs)
-
-            best_postprocessing = score_and_postprocessing[0][1]
-            if name == "val":
-                print("BEST POSTPROCESSING", best_postprocessing)
-                for k, v in best_postprocessing:
-                    self.log(f"postprocessing/{k}", v, logger=True)
-                self.epoch_best_postprocessing[epoch] = best_postprocessing
-            predicted_events = predicted_events_by_postprocessing[best_postprocessing]
-
-            if name == "test":
-                # Cache all predictions for later serialization
-                self.test_predictions = {
-                    "target": target.detach().cpu(),
-                    "prediction": prediction.detach().cpu(),
-                    "prediction_logit": prediction_logit.detach().cpu(),
-                    "target_events": self.target_events[name],
-                    "predicted_events": predicted_events,
-                    "timestamp": timestamp,
-                }
-
-            self.log_scores(
-                name, score_args=(predicted_events, self.target_events[name])
-            )
-
-
-class SplitMemmapDataset(Dataset):
-    """
-    Embeddings are memmap'ed, unless in-memory = True.
-
-    WARNING: Don't shuffle this or access will be SLOW.
-    """
-
-    def __init__(
-        self,
-        embedding_path: Path,
-        label_to_idx: Dict[str, int],
-        nlabels: int,
-        split_name: str,
-        embedding_type: str,
-        in_memory: bool,
-        metadata: bool,
-        task: str,
-        is_test: bool,
-        random_probe: bool,
-    ):
-        self.embedding_path = embedding_path
+        """
+        :param label_to_idx: Map from label string to integer index.
+        :param name: Override the name of this scoring function.
+        :param maximize: Maximize this score? (Otherwise, it's a loss or energy
+            we want to minimize, and I guess technically isn't a score.)
+        """
         self.label_to_idx = label_to_idx
-        self.nlabels = nlabels
-        self.split_name = split_name
-        self.embedding_type = embedding_type
-        self.task = task
-        self.is_test = is_test
-        self.random_probe = random_probe
+        if name:
+            self.name = name
+        self.maximize = maximize
 
-        self.dim = tuple(
-            json.load(
-                open(embedding_path.joinpath(f"{split_name}.embedding-dimensions.json"))
-            )
-        )
-        self.embeddings = np.memmap(
-            filename=embedding_path.joinpath(f"{split_name}.embeddings.npy"),
-            dtype=np.float32,
-            mode="r",
-            shape=self.dim,
-        )
-        if in_memory:
-            self.embeddings = torch.stack(
-                [torch.tensor(e) for e in tqdm(self.embeddings)]
-            )
-            nandim = self.embeddings.isnan().sum().tolist()
-            infdim = self.embeddings.isinf().sum().tolist()
-            assert nandim == 0 and infdim == 0
-
-        self.labels = pickle.load(
-            open(embedding_path.joinpath(f"{split_name}.target-labels.pkl"), "rb")
-        )
-
-        # Only used for event-based prediction, for validation and test scoring,
-        # For timestamp (event) embedding tasks,
-        # the metadata for each instance is {filename: , timestamp: }.
-        if self.embedding_type == "event" and metadata:
-            filename_timestamps_json = embedding_path.joinpath(
-                f"{split_name}.filename-timestamps.json"
-            )
-            self.metadata = [
-                {"filename": filename, "timestamp": timestamp}
-                for filename, timestamp in json.load(open(filename_timestamps_json))
-            ]
-        else:
-            self.metadata = [{}] * self.dim[0]
-        assert len(self.labels) == self.dim[0]
-        assert len(self.labels) == len(self.embeddings)
-        assert len(self.labels) == len(self.metadata)
-        assert self.embeddings[0].shape[0] == self.dim[1]
-
+    def __call__(self, *args, **kwargs) -> Union[Tuple[Tuple[str, float], ...], float]:
         """
-        For all labels, return a multi or one-hot vector.
-        This allows us to have tensors that are all the same shape.
-        Later we reduce this with an argmax to get the vocabulary indices.
+        Calls the compute function of the metric, and after validating the output,
+        returns the metric score
         """
-        ys = []
-        for idx in tqdm(range(len(self.labels))):
-            # If we indeed have self.label_to_idx!
-            if (
-                ("cartesian" not in task)
-                and ("polar" not in task)
-                and ("distance" not in task)
-                and ("accdoa" not in task)
-            ):
-                labels = [self.label_to_idx[str(label)] for label in self.labels[idx]]
-                y = label_to_binary_vector(labels, self.nlabels)
-            elif "distance" in task:
-                y = torch.abs(torch.tensor(self.labels[idx]))
-            elif "accdoa" in task:
-                y = torch.zeros((self.nlabels, 3))
-                # active_classes: list of strings (e.g., ["dog", "car"])
-                # active_doas: list of tuples (e.g., [(x1,y1,z1), (x2,y2,z2)])
-                if len(self.labels[idx]) == 0:
-                  active_classes = [] 
-                  active_doas = []
-                else:
-                  active_classes = []
-                  active_doas = []
-                  for label in self.labels[idx]:
-                    active_classes.append(label[0])
-                    active_doas.append(label[1])
-                
-                for class_str, doa_tuple in zip(active_classes, active_doas):
-                    # Convert string label to integer index
-                    class_idx = self.label_to_idx[str(class_str)]
-                    y[class_idx] = torch.tensor(doa_tuple).float()
-            else:
-                y = torch.tensor(self.labels[idx])
-            ys.append(y)
-        self.y = torch.stack(ys)
-        if self.y.ndim == 1:
-            self.y = self.y.unsqueeze(1)
-        if "accdoa" in task:
-            assert self.y.shape == (len(self.labels), self.nlabels, 3)
-        else:
-            assert self.y.shape == (len(self.labels), self.nlabels)
+        ret = self._compute(*args, **kwargs)
+        validate_score_return_type(ret)
+        return ret
 
-    def __len__(self) -> int:
-        return self.dim[0]
+    def _compute(
+        self, predictions: Any, targets: Any, **kwargs
+    ) -> Union[Tuple[Tuple[str, float], ...], float]:
+        """
+        Compute the score based on the predictions and targets.
+        This is a private function and the metric should be used as a functor
+        by calling the `__call__` method which calls this and also validates
+        the return type
+        """
+        raise NotImplementedError("Inheriting classes must implement this function")
 
-    def __getitem__(self, idx) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
-        if self.random_probe:
-            random_y_idx = random.randint(0, len(self) - 1)
-            return (
-                self.embeddings[idx],
-                self.y[idx if self.is_test else random_y_idx],
-                self.metadata[idx],
-            )
-        else:
-            return self.embeddings[idx], self.y[idx], self.metadata[idx]
+    def __str__(self):
+        return self.name
 
 
-def get_ref_accdoa_events(
-    references: torch.Tensor,
-    filenames: List[str],
-    ref_timestamps: Dict[str, List[float]],
-    nb_classes: int, 
-    label_to_idx : Dict[str, int] = None
-) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
+class Top1Accuracy(ScoreFunction):
+    name = "top1_acc"
 
-    #This event dict has to contain file_names as key and the values should be frame_ind : [[detected_class_idx_1, 0, x, y, z, 0], [detected_class_idx_2, 0, x, y, z, 0]]
-    #First key is the filename, and the second key in the dict is the frame_idx.    
-    event_dict: Dict[
-        str, Dict[int, List[List[int | float]]]
-    ] = {}
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # One hot
+        # Compute the number of correct predictions
+        correct = 0
+        for target, prediction in zip(targets, predictions):
+            assert prediction.ndim == 1
+            assert target.ndim == 1
+            predicted_class = np.argmax(prediction)
+            target_class = np.argmax(target)
 
-    for filename in filenames:
-        filename = os.path.basename(filename)
-        # Loads from the test/valid folds.
-        # Get the timestamp for the ref_timestamps, and map it into ACCDOA style?
-        assert sorted(ref_timestamps[filename]) == ref_timestamps[filename], f"Timestamps for {filename} is not sorted!"
-        for timestamp_idx, timestamp in enumerate(ref_timestamps[filename]):
-          events = references[filename][timestamp_idx]
-          if len(events) != 0: #If there is an active event
-            for event in events:
-              class_str = event[0]
-              doa_tuple = event[1]   
-              class_idx = label_to_idx[str(class_str)]
-              if filename not in event_dict:
-                event_dict[filename] = {}
-              if timestamp_idx not in event_dict[filename]:
-                event_dict[filename][timestamp_idx] = []
-              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1]), float(doa_tuple[2])])
+            if predicted_class == target_class:
+                correct += 1
 
-    return event_dict
+        return correct / len(targets)
 
-def get_accdoa_events(
-    predictions: torch.Tensor,
-    filenames: List[str],
-    timestamps,
-    nb_classes: int, 
-) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
+class ChromaAccuracy(ScoreFunction):
     """
-    Produces lists of events from a set of frame based label accdoas.
-    The input prediction tensor may contain frame predictions from a set of different
-    files concatenated together. file_timestamps has a list of filenames and
-    timestamps for each frame in the predictions tensor.
-
-    We split the predictions into separate tensors based on the filename and compute
-    events based on those individually.
-
-    If no postprocessing is specified (during training), we try a
-    variety of ways of postprocessing the predictions into events,
-    from the postprocessing_grid including median filtering and
-    minimum event length.
-
-
-    Args:
-        predictions: a tensor of frame based multi-label predictions.
-        filenames: a list of filenames where each entry corresponds
-            to a frame in the predictions tensor.
-        timestamps: a list of timestamps where each entry corresponds
-            to a frame in the predictions tensor.
-        idx_to_label: Index to label mapping.
-        postprocessing: See above.
-
-    Returns:
-        A dictionary from filtering params to the following values:
-        A dictionary of lists of events keyed on the filename slug.
-        The event list is of dicts of the following format:
-            {"label": str, "start": float ms, "end": float ms}
+    Score specifically for pitch detection -- converts all pitches to chroma first.
+    This score ignores octave errors in pitch classification.
     """
-    #Event files with filename_Dict.
-    event_files: Dict[str, Dict[int, torch.Tensor]] = {}
-    for timestamp_idx, (filename, timestamp) in tqdm(enumerate(zip(filenames, timestamps))):
-        slug = Path(filename).name
-        if slug not in event_files:
-          event_files[slug] = {}
-        #Get the ACCDOA predictions for the timestamp.
-        event_files[slug][float(timestamp)] = predictions[timestamp_idx]
+
+    name = "chroma_acc"
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        # Compute the number of correct predictions
+        correct = 0
+        for target, prediction in zip(targets, predictions):
+            assert prediction.ndim == 1
+            assert target.ndim == 1
+            predicted_class = np.argmax(prediction)
+            target_class = np.argmax(target)
+
+            # Ignore octave errors by converting the predicted class to chroma before
+            # checking for correctness.
+            if predicted_class % 12 == target_class % 12:
+                correct += 1
+
+        return correct / len(targets)
 
 
-    #This event dict has to contain file_names as key and the values should be frame_ind : [[detected_class_idx_1, 0, x, y, z, 0], [detected_class_idx_2, 0, x, y, z, 0]]
-    #First key is the filename, and the second key in the dict is the frame_idx.    
-    event_dict: Dict[
-        str, Dict[int, List[List[int | float]]]
-    ] = {}
-    
-    for file_name in tqdm(event_files.keys()):
-        accdoa_dict, diff = get_accdoa_labels(event_files[file_name], nb_classes)
-        event_dict[file_name] = accdoa_dict
-
-    return event_dict, diff
-
-
-def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
+class SoundEventScore(ScoreFunction):
     """
-    Extracts SED labels and coordinates from ACCDOA format.
-    
-    Returns:
-        sed: Boolean array (Total_Frames, nb_classes). Active if magnitude > 0.5.
-        accdoa_vectors: Array (Total_Frames, nb_classes, 3). Format [x, y, z].
-        frame_interval: Float (time difference between frames) or Default 0.02.
+    Scores for sound event detection tasks using sed_eval
     """
-    
-    # 1. Handle Input (Dict vs Tensor) & Timestamps
-    timestamps = sorted(accdoa_in.keys())
-    predictions_list = [accdoa_in[t].detach().cpu().numpy() for t in timestamps]
-    #Predictions per timestamp (actually frame)
-    accdoa_vectors = np.stack(predictions_list)
-    predictions = {} 
-    for time_frame in range(len(accdoa_vectors)):
-        timestamp_prediction = accdoa_vectors[time_frame] 
-        x = timestamp_prediction[:, 0]
-        y = timestamp_prediction[:, 1]
-        z = timestamp_prediction[:, 2]
-        sed_magnitude = np.sqrt(x**2 + y**2 + z**2)
-        sed = np.where(sed_magnitude > 0.5)[0]
-        if time_frame not in predictions: 
-            predictions[time_frame] = [] 
-        #For each predicted class, append the class index and float to the predictions
-        for class_idx in sed:
-            predictions[time_frame].append([int(class_idx), 0, float(x[class_idx]), float(y[class_idx]), float(z[class_idx])])
 
-    return predictions, np.mean(np.diff(np.array(timestamps)))
+    # Score class must be defined in inheriting classes
+    score_class: sed_eval.sound_event.SoundEventMetrics = None
 
-
-def create_events_from_prediction(
-    prediction_dict: Dict[float, torch.Tensor],
-    idx_to_label: Dict[int, str],
-    threshold: float = 0.5,
-    median_filter_ms: float = 150,
-    min_duration: float = 60.0,
-) -> List[Dict[str, Union[float, str]]]:
-    """
-    Takes a set of prediction tensors keyed on timestamps and generates events.
-    (This is for one particular audio scene.)
-    We convert the prediction tensor to a binary label based on the threshold value. Any
-    events occurring at adjacent timestamps are considered to be part of the same event.
-    This loops through and creates events for each label class.
-    We optionally apply median filtering to predictions.
-    We disregard events that are less than the min_duration milliseconds.
-
-    Args:
-        prediction_dict: A dictionary of predictions keyed on timestamp
-            {timestamp -> prediction}. The prediction is a tensor of label
-            probabilities.
-        idx_to_label: Index to label mapping.
-        threshold: Threshold for determining whether to apply a label
-        min_duration: the minimum duration in milliseconds for an
-                event to be included.
-
-    Returns:
-        A list of dicts withs keys "label", "start", and "end"
-    """
-    # Make sure the timestamps are in the correct order
-    timestamps = np.array(sorted(prediction_dict.keys()))
-
-    # Create a sorted numpy matrix of frame level predictions for this file. We convert
-    # to a numpy array here before applying a median filter.
-    predictions = np.stack(
-        [prediction_dict[t].detach().cpu().numpy() for t in timestamps]
-    )
-
-    # Optionally apply a median filter here to smooth out events.
-    ts_diff = np.mean(np.diff(timestamps))
-    if median_filter_ms:
-        filter_width = int(round(median_filter_ms / ts_diff))
-        if filter_width:
-            predictions = median_filter(predictions, size=(filter_width, 1))
-
-    # Convert probabilities to binary vectors based on threshold
-    predictions = (predictions > threshold).astype(np.int8)
-
-    events = []
-    for label in range(predictions.shape[1]):
-        for group in more_itertools.consecutive_groups(
-            np.where(predictions[:, label])[0]
-        ):
-            grouptuple = tuple(group)
-            assert tuple(sorted(grouptuple)) == grouptuple, (
-                f"{sorted(grouptuple)} != {grouptuple}"
-            )
-            startidx, endidx = (grouptuple[0], grouptuple[-1])
-
-            start = timestamps[startidx]
-            end = timestamps[endidx]
-            # Add event if greater than the minimum duration threshold
-            if end - start >= min_duration:
-                events.append(
-                    {"label": idx_to_label[label], "start": start, "end": end}
-                )
-
-    # This is just for pretty output, not really necessary
-    events.sort(key=lambda k: k["start"])
-    return events
-
-
-def get_events_for_all_files(
-    predictions: torch.Tensor,
-    filenames: List[str],
-    timestamps: torch.Tensor,
-    idx_to_label: Dict[int, str],
-    postprocessing_grid: Dict[str, List[float]],
-    postprocessing: Optional[Tuple[Tuple[str, Any], ...]] = None,
-) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
-    """
-    Produces lists of events from a set of frame based label probabilities.
-    The input prediction tensor may contain frame predictions from a set of different
-    files concatenated together. file_timestamps has a list of filenames and
-    timestamps for each frame in the predictions tensor.
-
-    We split the predictions into separate tensors based on the filename and compute
-    events based on those individually.
-
-    If no postprocessing is specified (during training), we try a
-    variety of ways of postprocessing the predictions into events,
-    from the postprocessing_grid including median filtering and
-    minimum event length.
-
-    If postprocessing is specified (during test, chosen at the best
-    validation epoch), we use this postprocessing.
-
-    Args:
-        predictions: a tensor of frame based multi-label predictions.
-        filenames: a list of filenames where each entry corresponds
-            to a frame in the predictions tensor.
-        timestamps: a list of timestamps where each entry corresponds
-            to a frame in the predictions tensor.
-        idx_to_label: Index to label mapping.
-        postprocessing: See above.
-
-    Returns:
-        A dictionary from filtering params to the following values:
-        A dictionary of lists of events keyed on the filename slug.
-        The event list is of dicts of the following format:
-            {"label": str, "start": float ms, "end": float ms}
-    """
-    # This probably could be more efficient if we make the assumption that
-    # timestamps are in sorted order. But this makes sure of it.
-    assert predictions.shape[0] == len(filenames)
-    assert predictions.shape[0] == len(timestamps)
-    event_files: Dict[str, Dict[float, torch.Tensor]] = {}
-    for i, (filename, timestamp) in tqdm(enumerate(zip(filenames, timestamps))):
-        slug = Path(filename).name
-
-        # Key on the slug to be consistent with the ground truth
-        if slug not in event_files:
-            event_files[slug] = {}
-
-        # Save the predictions for the file keyed on the timestamp
-        event_files[slug][float(timestamp)] = predictions[i]
-
-    # Create events for all the different files. Store all the events as a dictionary
-    # with the same format as the ground truth from the luigi pipeline.
-    # Ex) { slug -> [{"label" : "woof", "start": 0.0, "end": 2.32}, ...], ...}
-    event_dict: Dict[
-        Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[float, str]]]]
-    ] = {}
-    if postprocessing:
-        postprocess = postprocessing
-        event_dict[postprocess] = {}
-        for slug, timestamp_predictions in event_files.items():
-            event_dict[postprocess][slug] = create_events_from_prediction(
-                timestamp_predictions, idx_to_label, **dict(postprocess)
-            )
-    else:
-        postprocessing_confs = list(ParameterGrid(postprocessing_grid))
-        for postprocess_dict in tqdm(postprocessing_confs):
-            postprocess = tuple(postprocess_dict.items())
-            event_dict[postprocess] = {}
-            for slug, timestamp_predictions in tqdm(event_files.items()):
-                # I think this is wrong; Let's see
-                event_dict[postprocess][slug] = create_events_from_prediction(
-                    timestamp_predictions, idx_to_label, **postprocess_dict
-                )
-
-    return event_dict
-
-
-def label_vocab_nlabels(embedding_path: Path) -> Tuple[pd.DataFrame, int]:
-    # Reads the label vocab from the labelvocabulary.csv
-    label_vocab = pd.read_csv(embedding_path.joinpath("labelvocabulary.csv"))
-    nlabels = len(label_vocab)
-    assert nlabels == label_vocab["idx"].max() + 1
-    return (label_vocab, nlabels)
-
-
-def dataloader_from_split_name(
-    split_name: Union[str, List[str]],
-    embedding_path: Path,
-    label_to_idx: Dict[str, int],
-    nlabels: int,
-    embedding_type: str,
-    in_memory: bool,
-    task: str,
-    metadata: bool = True,
-    batch_size: int = 64,
-    pin_memory: bool = True,
-    is_test: bool = False,
-    random_probe: bool = False,
-) -> DataLoader:
-    """
-    Get the dataloader for a `split_name` or a list of `split_name`
-
-    For a list of `split_name`, the dataset for each split will be concatenated.
-
-    Case 1 - split_name is a string
-        The Dataloader is built from a single data split.
-    Case 2 - split_name is a list of string
-        The Dataloader combines the data from the list of splits and
-        returns a combined dataloader. This is useful when combining
-        multiple folds of data to create the training or validation
-        dataloader. For example, in k-fold, the training data-loader
-        might be made from the first 4/5 folds, and calling this function
-        with [fold00, fold01, fold02, fold03] will create the
-        required dataloader
-    """
-    if isinstance(split_name, (list, set)):
-        dataset = ConcatDataset(
-            [
-                # We need to do something with label_to_idx here...
-                # Because we already have the labels!
-                SplitMemmapDataset(
-                    embedding_path=embedding_path,
-                    label_to_idx=label_to_idx,
-                    nlabels=nlabels,
-                    split_name=name,
-                    embedding_type=embedding_type,
-                    in_memory=in_memory,
-                    metadata=metadata,
-                    task=task,
-                    is_test=is_test,
-                    random_probe=random_probe,
-                )
-                for name in split_name
-            ]
-        )
-    elif isinstance(split_name, str):
-        dataset = SplitMemmapDataset(
-            embedding_path=embedding_path,
-            label_to_idx=label_to_idx,
-            nlabels=nlabels,
-            split_name=split_name,
-            embedding_type=embedding_type,
-            in_memory=in_memory,
-            metadata=metadata,
-            task=task,
-            is_test=is_test,
-            random_probe=random_probe,
-        )
-    else:
-        raise ValueError("split_name should be a list or string")
-
-    print(
-        f"Getting embeddings for split {split_name}, "
-        + f"which has {len(dataset)} instances."
-    )
-
-    # It is not recommended to return CUDA tensors using multi-processing
-    # If automatic memory pinning is set to True then the num_workers should be zero
-    # https://pytorch.org/docs/stable/data.html#single-and-multi-process-data-loading
-    if in_memory and not pin_memory:
-        num_workers = NUM_WORKERS
-    else:
-        # We are disk bound or using automatic memory pinning,
-        # so multiple workers might cause thrashing and slowdowns
-        num_workers = 0
-
-    if in_memory and split_name == "train":
-        shuffle = True
-    else:
-        # We don't shuffle if we are memmap'ing from disk
-        # We don't shuffle validation and test, to maintain the order
-        # of the event metadata
-        shuffle = False
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        pin_memory=pin_memory,
-        num_workers=num_workers,
-    )
-
-
-class GridPointResult:
     def __init__(
         self,
-        predictor,
-        model_path: str,
-        epoch: int,
-        time_in_min: float,
-        hparams: Dict[str, Any],
-        postprocessing: Optional[Tuple[Tuple[str, Any], ...]],
-        trainer: pl.Trainer,
-        validation_score: float,
-        score_mode: str,
-        conf: Dict,
+        label_to_idx: Dict[str, int],
+        scores: Tuple[str],
+        params: Dict = None,
+        name: Optional[str] = None,
+        maximize: bool = True,
     ):
-        self.predictor = predictor
-        self.model_path = model_path
-        self.epoch = epoch
-        self.time_in_min = time_in_min
-        self.hparams = hparams
-        self.postprocessing = postprocessing
-        self.trainer = trainer
-        self.validation_score = validation_score
-        self.score_mode = score_mode
-        self.conf = conf
+        """
+        :param scores: Scores to use, from the list of overall SED eval scores.
+            The first score in the tuple will be the primary score for this metric
+        :param params: Parameters to pass to the scoring function,
+                       see inheriting children for details.
+        """
+        if params is None:
+            params = {}
+        super().__init__(label_to_idx=label_to_idx, name=name, maximize=maximize)
+        self.scores = scores
+        self.params = params
+        assert self.score_class is not None
 
-    def __repr__(self):
-        return json.dumps(
-            (
-                self.validation_score,
-                self.epoch,
-                hparams_to_json(self.hparams),
-                self.postprocessing,
+    def _compute(
+        self, predictions: Dict, targets: Dict, **kwargs
+    ) -> Tuple[Tuple[str, float], ...]:
+        # Containers of events for sed_eval
+        reference_event_list = self.sed_eval_event_container(targets)
+        estimated_event_list = self.sed_eval_event_container(predictions)
+
+        # This will break in Python < 3.6 if the dict order is not
+        # the insertion order I think. I'm a little worried about this line
+        scores = self.score_class(
+            event_label_list=list(self.label_to_idx.keys()), **self.params
+        )
+
+        for filename in predictions:
+            #We need to understand here.
+            #It calculates the scores per filename. This is obvious.
+            scores.evaluate(
+                reference_event_list=reference_event_list.filter(filename=filename),
+                estimated_event_list=estimated_event_list.filter(filename=filename),
             )
+
+        # results_overall_metrics return a pretty large nested selection of scores,
+        # with dicts of scores keyed on the type of scores, like f_measure, error_rate,
+        # accuracy
+        nested_overall_scores: Dict[str, Dict[str, float]] = (
+            scores.results_overall_metrics()
         )
-
-
-
-def map_to_frames(target_events: Dict[str, List[Dict[str, Any]]], timestamps: Dict[str, List[float]]):
-    #Maps to frames:
-    # {'c0e28dc8.wav': [{'label': 'jack_hammer', 'direction': [-0.5751132772097123, -0.33771451916904743, 0.7451131604793488], 'start': 345.88007775, 'end': 4345.88007775}
-    # A list of labels present at each timestamp
-    timestamp_labels = {}
-
-    for file_name in target_events:
-        events = target_events[file_name]
-        tree = IntervalTree()
-        for event in events:
-            tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["direction"]))
-        
-        labels_for_sound = []
-        for time_stamp in timestamps[file_name]:
-            interval_labels: List[str | Tuple[str, List[float]]] = [interval.data for interval in tree[time_stamp]]
-            labels_for_sound.append(interval_labels)
-        timestamp_labels[file_name] = labels_for_sound
-
-    return timestamp_labels
-
-def load_timestamps(embedding_path, metadata, split_name):
-    import os 
-    filename_timestamps_json = embedding_path.joinpath(
-        f"{split_name}.filename-timestamps.json"
-    )
-    timestamps_ = {} 
-    for filename, timestamps in json.load(open(filename_timestamps_json)):
-        filename = os.path.basename(filename)
-        if filename not in timestamps_:
-          timestamps_[filename] = []
-        timestamps_[filename].append(timestamps)
-    return timestamps_
-
-
-def task_predictions_train(
-    embedding_path: Path,
-    embedding_size: int,
-    metadata: Dict[str, Any],
-    data_splits: Dict[str, List[str]],
-    label_to_idx: Dict[str, int],
-    nlabels: int,
-    scores: List[ScoreFunction],
-    conf: Dict,
-    use_scoring_for_early_stopping: bool,
-    gpus: Any,
-    in_memory: bool,
-    deterministic: bool,
-    task: str,
-    random_probe: bool = False,
-) -> GridPointResult:
-    """
-    Train a predictor for a specific task using pre-computed embeddings.
-    """
-
-    start = time.time()
-    predictor: AbstractPredictionModel
-    if metadata["embedding_type"] == "event":
-        def _combine_target_events(split_names: List[str]):
-            """
-            This combines the target events from the list of splits and
-            returns the combined target events. This is useful when combining
-            multiple folds of data to create the training or validation
-            dataloader. For example, in k-fold, the training data-loader
-            might be made from the first 4/5 folds, and calling this function
-            with [fold00, fold01, fold02, fold03] will return the
-            aggregated target events across all the folds
-            """
-            combined_target_events: Dict = {}
-            for split_name in split_names:
-                target_events = json.load(
-                    embedding_path.joinpath(f"{split_name}.json").open()
-                )
-                common_keys = set(combined_target_events.keys()).intersection(
-                    target_events.keys()
-                )
-                assert len(common_keys) == 0, (
-                    "Target events from one split should not override "
-                    "target events from another. This is very unlikely as the "
-                    "target_event is keyed on the files which are distinct for "
-                    "each split"
-                )
-                combined_target_events.update(target_events)
-            return combined_target_events
-
-        validation_target_events: Dict = _combine_target_events(data_splits["valid"])
-        test_target_events: Dict = _combine_target_events(data_splits["test"])
-
-        # The postprocessing search space for getting the
-        # best task specific postprocessing, can be task
-        # specific, present in the task metadata in
-        # evaluation_params.postprocessing_grid. If not, the default
-        # EVENT_POSTPROCESSING_GRID will be used.
-        if "event_postprocessing_grid" in metadata.get("evaluation_params", {}):
-            postprocessing_grid = metadata["evaluation_params"][
-                "event_postprocessing_grid"
-            ]
-        else:
-            postprocessing_grid = EVENT_POSTPROCESSING_GRID
-
-
-        if metadata["prediction_type"] == "accdoa":
-            if metadata["source_dynamics"] == "static":
-                _timestamps_test = load_timestamps(embedding_path, metadata, "test")
-                _timestamps_valid = load_timestamps(embedding_path, metadata, "valid")
-                validation_target_events: Dict = map_to_frames(validation_target_events, _timestamps_valid)
-                test_target_events: Dict = map_to_frames(test_target_events, _timestamps_test)
-            
-            predictor = ACCDOAPredictionModel(
-                nfeatures=embedding_size,
-                label_to_idx=label_to_idx,
-                nlabels=nlabels,
-                prediction_type=metadata["prediction_type"],
-                scores=scores,
-                validation_target_events=validation_target_events,
-                test_target_events=test_target_events,
-                validation_target_timestamps= _timestamps_valid,
-                test_target_timestamps= _timestamps_test,
-                conf=conf,
-                use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-                source = metadata["source_dynamics"],
-            )
-        else:
-            predictor = EventPredictionModel(
-                nfeatures=embedding_size,
-                label_to_idx=label_to_idx,
-                nlabels=nlabels,
-                prediction_type=metadata["prediction_type"],
-                scores=scores,
-                validation_target_events=validation_target_events,
-                test_target_events=test_target_events,
-                postprocessing_grid=postprocessing_grid,
-                conf=conf,
-                use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-            )
-    elif metadata["embedding_type"] == "scene":
-        predictor = ScenePredictionModel(
-            nfeatures=embedding_size,
-            label_to_idx=label_to_idx,
-            nlabels=nlabels,
-            prediction_type=metadata["prediction_type"],
-            scores=scores,
-            conf=conf,
-            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
+        # Open up nested overall scores
+        overall_scores: Dict[str, float] = dict(
+            ChainMap(*nested_overall_scores.values())
         )
-    else:
-        raise ValueError(f"Unknown embedding_type {metadata['embedding_type']}")
+        # Return the required scores as tuples. The scores are returned in the
+        # order they are passed in the `scores` argument
 
-    if use_scoring_for_early_stopping:
-        # First score is the target
-        target_score = f"val_{str(scores[0])}"
-        if scores[0].maximize:
-            mode = "max"
-        else:
-            mode = "min"
-    else:
-        # This loss is much faster, but will give poorer scores
-        target_score = "val_loss"
-        mode = "min"
-    checkpoint_callback = ModelCheckpoint(monitor=target_score, mode=mode)
-    early_stop_callback = EarlyStopping(
-        monitor=target_score,
-        min_delta=0.00,
-        patience=conf["patience"],
-        check_on_train_epoch_end=False,
-        verbose=False,
-        mode=mode,
-    )
+        return tuple([(score, overall_scores[score]) for score in self.scores])
 
-    logger = CSVLogger(Path("logs").joinpath(embedding_path))
-    logger.log_hyperparams(hparams_to_json(conf))
-
-    trainer = pl.Trainer(
-        callbacks=[checkpoint_callback]
-        if random_probe
-        else [checkpoint_callback, early_stop_callback],
-        gpus=gpus,
-        check_val_every_n_epoch=conf["check_val_every_n_epoch"],
-        max_epochs=50 if random_probe else conf["max_epochs"],
-        deterministic=deterministic,
-        num_sanity_val_steps=0,
-        # profiler=profiler,
-        # profiler="pytorch",
-        profiler="simple",
-        logger=logger,
-    )
-    train_dataloader = dataloader_from_split_name(
-        data_splits["train"],
-        embedding_path,
-        label_to_idx,
-        nlabels,
-        metadata["embedding_type"],
-        batch_size=conf["batch_size"],
-        in_memory=in_memory,
-        metadata=False,
-        task=task,
-        is_test=False,
-        random_probe=random_probe,
-    )
-    valid_dataloader = dataloader_from_split_name(
-        data_splits["valid"],
-        embedding_path,
-        label_to_idx,
-        nlabels,
-        metadata["embedding_type"],
-        batch_size=conf["batch_size"],
-        in_memory=in_memory,
-        task=task,
-        is_test=True,
-        random_probe=random_probe,
-    )
-    trainer.fit(predictor, train_dataloader, valid_dataloader)
-    if checkpoint_callback.best_model_score is not None:
-        sys.stdout.flush()
-        end = time.time()
-        time_in_min = (end - start) / 60
-        epoch = torch.load(checkpoint_callback.best_model_path, weights_only = False)["epoch"]
-        print(f"Loaded epoch : {epoch}")
-        if metadata["embedding_type"] == "event":
-            best_postprocessing = predictor.epoch_best_postprocessing_or_default(epoch)
-        else:
-            best_postprocessing = []
-        # TODO: Postprocessing
-        logger.log_metrics({"time_in_min": time_in_min})
-        logger.finalize("success")
-        logger.save()
-        return GridPointResult(
-            predictor=predictor,
-            model_path=checkpoint_callback.best_model_path,
-            epoch=epoch,
-            time_in_min=time_in_min,
-            hparams=dict(predictor.hparams),
-            postprocessing=best_postprocessing,
-            trainer=trainer,
-            validation_score=checkpoint_callback.best_model_score.detach().cpu().item(),
-            score_mode=mode,
-            conf=conf,
-        )
-    else:
-        raise ValueError(
-            f"No score {checkpoint_callback.best_model_score} for this model"
-        )
-
-
-def task_predictions_test(
-    embedding_path: Path,
-    grid_point: GridPointResult,
-    metadata: Dict[str, Any],
-    data_splits: Dict[str, List[str]],
-    label_to_idx: Dict[str, int],
-    nlabels: int,
-    in_memory: bool,
-    task: str,
-):
-    """
-    Test a pre-trained predictor using precomputed embeddings.
-    """
-    test_dataloader = dataloader_from_split_name(
-        data_splits["test"],
-        embedding_path,
-        label_to_idx,
-        nlabels,
-        metadata["embedding_type"],
-        batch_size=grid_point.conf["batch_size"],
-        in_memory=in_memory,
-        task=task,
-        is_test=True,
-        random_probe=False,
-    )
-
-    trainer = grid_point.trainer
-    # This hack is necessary because we use the best validation epoch to
-    # choose the event postprocessing
-    trainer.lightning_module.inference_epoch = grid_point.epoch
-    # Run tests
-    test_results = trainer.test(
-        ckpt_path=grid_point.model_path, dataloaders=test_dataloader
-    )
-    assert len(test_results) == 1, "Should have only one test dataloader"
-    test_results = test_results[0]
-    return test_results
-
-
-
-def serialize_value(v):
-    if isinstance(v, str) or isinstance(v, float) or isinstance(v, int):
-        return v
-    else:
-        return str(v)
-
-
-def hparams_to_json(hparams):
-    return {k: serialize_value(v) for k, v in hparams.items()}
-
-
-def data_splits_from_folds(folds: List[str]) -> List[Dict[str, List[str]]]:
-    """
-    Create data splits by using Leave One Out Cross Validation strategy.
-
-    folds is a list of dataset partitions created during pre-processing. For example,
-    for 5-fold cross val: ["fold00", "fold01", ..., "fold04"]. This function will create
-    k test, validation, and train splits using these folds. Each fold is successively
-    treated as test split, the next split as validation, and the remaining as train.
-    Folds will be sorted before applying the above strategy.
-
-    With 5-fold, for example, we would have:
-    test=fold00, val=fold01, train=fold02..04,
-    test=fold01, val=fold02, train=fold03,04,01
-    ...
-    test=fold04, val=fold00, train=01..03
-    """
-    sorted_folds = tuple(sorted(folds))
-    assert len(sorted_folds) == len(set(sorted_folds)), "Folds are not unique"
-    num_folds = len(sorted_folds)
-    all_data_splits: List[Dict[str, List[str]]] = []
-    for fold_idx in range(num_folds):
-        test_fold = sorted_folds[fold_idx]
-        valid_fold = sorted_folds[(fold_idx + 1) % num_folds]
-        train_folds = [f for f in sorted_folds if f not in (test_fold, valid_fold)]
-        all_data_splits.append(
-            {
-                "train": train_folds,
-                "valid": [valid_fold],
-                "test": [test_fold],
-            }
-        )
-        assert not set(train_folds).intersection({test_fold, valid_fold}), (
-            "Train folds are not distinct from the dev and the test folds"
-        )
-
-    return all_data_splits
-
-
-def aggregate_test_results(results: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-    """
-    Aggregates test results over folds by mean and standard deviation
-    """
-    results_df = pd.DataFrame.from_dict(results, orient="index")
-    aggregate_results = {}
-    for score in results_df:
-        aggregate_results[f"{score}_mean"] = results_df[score].mean()
-        aggregate_results[f"{score}_std"] = results_df[score].std()
-
-    return aggregate_results
-
-
-def get_splits_from_metadata(metadata: Dict) -> List[Dict[str, List[str]]]:
-    """
-    Extracts the splits for training from the task metadata. If there are folds
-    present then this creates a set of k splits for each fold.
-    Args:
-        metadata: The preprocessing task metadata
-    Returns:
-        list(dict): The `data_splits`, are created from the splits prepared by
-            the hearpreprocess pipeline and represent the actual splits which
-            will be used for training, testing and validation
-            Each Data Split is a dict with the following keys and values:
-                - train (list): The splits to be used for training
-                - valid (list): The splits to be used for validation
-                - test (list): The splits to be used for testing
-            The data splits produced directly depend on the `split_mode`
-                of the hearpreprocess task configuration
-                - If the split mode is `new_split_kfold` or `presplit_kfold`,
-                    each data split will be represent one out of the multiple
-                    combination of LOOCV (refer function `data_splits_from_folds`)
-                - If the split mode is `trainvaltest`, there is a predefined
-                    data split and hence there will only be one data split which is
+    @staticmethod
+    def sed_eval_event_container(
+        x: Dict[str, List[Dict[str, Any]]],
+    ) -> MetaDataContainer:
+        # Reformat event list for sed_eval
+        reference_events = []
+        for filename, event_list in x.items():
+            for event in event_list:
+                reference_events.append(
                     {
-                        "train": ["train"],
-                        "valid": ["valid"],
-                        "test": ["test"],
+                        # Convert from ms to seconds for sed_eval
+                        "event_label": str(event["label"]),
+                        "event_onset": event["start"] / 1000.0,
+                        "event_offset": event["end"] / 1000.0,
+                        "file": filename,
                     }
-                    This data split indicates that the splits (from hearpreprocess )
-                    will be used for training,
-                    validation and testing as defined by the name of the split
+                )
+        return  MetaDataContainer(reference_events)
 
-    Raises:
-        AssertionError: If the `split_mode` of the metadata is invalid.
-            Valid split modes are - `trainvaltest`, `new_split_kfold`, `presplit_kfold`
+class SELD(ScoreFunction):
+    def __init__(
+        self,
+        label_to_idx: Dict[str, int],
+        scores: Tuple[str],
+        params: Dict = None,
+        name: Optional[str] = None,
+        maximize: bool = True,
+    ):
+        if params is None: params = {}
+        super().__init__(label_to_idx=label_to_idx, name=name, maximize=maximize)
+        self.scores = scores
+        self.params = params
 
+    def _compute(self,
+        pred_dicts,
+        ref_dicts,
+        _nb_label_frames_1s) -> Tuple[Tuple[str, float], ...]:
+        
+        overall_scores = {}
+
+        eval = SELDMetrics(nb_classes=self.params["nb_classes"], doa_threshold=self.params["doa_threshold"], average=self.params["average"])
+        for file_name in pred_dicts.keys():
+            pred_dict = pred_dicts[file_name]
+            ref_dict = ref_dicts[file_name]
+            #Our dictionaries are all in cartesian format, and SELD metric expect polar.
+            pred_dict = convert_output_format_cartesian_to_polar(pred_dict)
+            ref_dict = convert_output_format_cartesian_to_polar(ref_dict)
+            nb_ref_frames = max(list(ref_dict.keys()))
+            pred_labels = segment_labels(pred_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
+            ref_labels = segment_labels(ref_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
+            print(file_name)
+            eval.update_seld_scores(pred_labels, ref_labels)
+
+        # Overall SED and DOA scores
+        ER, F, LE, LR, seld_scr, classwise_results = eval.compute_seld_scores()
+        overall_scores["ER"] = ER
+        overall_scores["F"] = F 
+        overall_scores["LE"] = LE
+        overall_scores["LR"] = LR 
+        overall_scores["SELD"] = seld_scr
+
+        return tuple([(score, float(overall_scores[score])) for score in self.scores])
+
+class SegmentBasedScore(SoundEventScore):
     """
-    data_splits: List[Dict[str, List[str]]]
-    if metadata["split_mode"] == "trainvaltest":
-        # There are train/validation/test splits predefined. These are the only splits
-        # that will be considered during training and testing.
-        data_splits = [
-            {
-                "train": ["train"],
-                "valid": ["valid"],
-                "test": ["test"],
-            }
-        ]
-    elif metadata["split_mode"] in ["new_split_kfold", "presplit_kfold"]:
-        folds = metadata["splits"]
-        # Folds should be a list of strings
-        assert all(isinstance(x, str) for x in folds)
-        # If we are using k-fold cross-validation then get a list of the
-        # splits to test over. This expects that k data folds were generated
-        # during pre-processing and the names of each of these folds is listed
-        # in the metadata["folds"] variable.
-        data_splits = data_splits_from_folds(folds)
-    else:
-        raise AssertionError(
-            f"Unknown split_mode: {metadata['split_mode']} in task metadata."
-        )
+    segment-based scores - the ground truth and system output are compared in a
+    fixed time grid; sound events are marked as active or inactive in each segment;
 
-    return data_splits
-
-
-def sort_grid_points(
-    grid_point_results: List[GridPointResult],
-) -> List[GridPointResult]:
-    """
-    Sort grid point results in place, so that the first result
-    is the best.
-    """
-    assert len(set([g.score_mode for g in grid_point_results])) == 1, (
-        "Score modes should be same for all the grid points"
-    )
-    mode: str = grid_point_results[0].score_mode
-    # Pick the model with the best validation score
-    if mode == "max":
-        grid_point_results = sorted(
-            grid_point_results, key=lambda g: g.validation_score, reverse=True
-        )
-    elif mode == "min":
-        grid_point_results = sorted(
-            grid_point_results, key=lambda g: g.validation_score
-        )
-    else:
-        raise ValueError(f"mode = {mode}")
-
-    return grid_point_results
-
-
-def print_scores(
-    grid_point_results: List[GridPointResult],
-    embedding_path: Path,
-    logger: logging.Logger,
-):
-    grid_point_results = sort_grid_points(grid_point_results)
-    for g in grid_point_results:
-        # Don't log this since it is diagnostic and repetitive
-        print(f"Grid Point Summary: {g}")
-
-
-def task_predictions(
-    embedding_path: Path,
-    embedding_size: int,
-    grid_points: int,
-    gpus: Optional[int],
-    in_memory: bool,
-    deterministic: bool,
-    grid: str,
-    logger: logging.Logger,
-):
-    # By setting workers=True in seed_everything(), Lightning derives
-    # unique seeds across all dataloader workers and processes
-    # for torch, numpy and stdlib random number generators.
-    # Note that if you change the number of workers, determinism
-    # might change.
-    # However, it appears that workers=False does get deterministic
-    # results on 4 multi-worker jobs I ran, probably because our
-    # dataloader doesn't do any augmentation or use randomness.
-    if deterministic:
-        seed_everything(42, workers=True)
-
-    metadata = json.load(embedding_path.joinpath("task_metadata.json").open())
-    label_vocab, nlabels = label_vocab_nlabels(embedding_path)
-
-    # wandb.init(project="heareval", tags=["predictions", embedding_path.name])
-
-    label_to_idx = label_vocab_as_dict(label_vocab, key="label", value="idx")
-    scores = [
-        available_scores[score](label_to_idx=label_to_idx)
-        for score in metadata["evaluation"]
-    ]
-
-    use_scoring_for_early_stopping = metadata.get(
-        "use_scoring_for_early_stopping", True
-    )
-
-    # Data splits for training
-    data_splits = get_splits_from_metadata(metadata)
-
-    # Construct the grid points for model creation
-    if grid == "default":
-        final_grid = copy.copy(PARAM_GRID)
-    elif grid == "fast":
-        final_grid = copy.copy(FAST_PARAM_GRID)
-    elif grid == "faster":
-        final_grid = copy.copy(FASTER_PARAM_GRID)
-    else:
-        raise ValueError(
-            f"Unknown grid type: {grid}. Please select default, fast, or faster"
-        )
-
-    # Update with task specific grid parameters
-    # From the global TASK_SPECIFIC_PARAM_GRID
-    if metadata["task_name"] in TASK_SPECIFIC_PARAM_GRID:
-        final_grid.update(TASK_SPECIFIC_PARAM_GRID[metadata["task_name"]])
-
-    # From task specific parameter grid in the task metadata
-    # We add this option, so that task specific param grid can be used
-    # for secret tasks, without mentioning them in the global
-    # TASK_SPECIFIC_PARAM_GRID. Ideally one out of the two option should be
-    # there
-    if "task_specific_param_grid" in metadata.get("evaluation_params", {}):
-        final_grid.update(metadata["evaluation_params"]["task_specific_param_grid"])
-
-    # Model selection
-    confs = list(ParameterGrid(final_grid))
-    random.shuffle(confs)
-
-    grid_point_results = []
-    for confi, conf in tqdm(enumerate(confs[:grid_points]), desc="grid"):
-        logger.info(f"Grid point {confi + 1} of {grid_points}: {conf}")
-        grid_point_result = task_predictions_train(
-            embedding_path=embedding_path,
-            embedding_size=embedding_size,
-            metadata=metadata,
-            data_splits=data_splits[0],
-            label_to_idx=label_to_idx,
-            nlabels=nlabels,
-            scores=scores,
-            conf=conf,
-            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-            gpus=gpus,
-            in_memory=in_memory,
-            deterministic=deterministic,
-            task=metadata["prediction_type"],
-        )
-        logger.info(f" result: {grid_point_result}")
-        grid_point_results.append(grid_point_result)
-        print_scores(grid_point_results, embedding_path, logger)
-
-    # Use the best hyperparameters to train models for remaining folds,
-    # then compute test scores using the resulting models
-    grid_point_results = sort_grid_points(grid_point_results)
-    best_grid_point = grid_point_results[0]
-    logger.info(
-        "Best Grid Point Validation Score: "
-        f"{best_grid_point.validation_score}  "
-        "Grid Point HyperParams: "
-        f"{best_grid_point.hparams}  "
-    )
-
-    # Train predictors for the remaining splits using the hyperparameters selected
-    # from the grid search.
-    split_grid_points = [best_grid_point]
-    for spliti, split in tqdm(enumerate(data_splits[1:]), desc="split"):
-        logger.info(f"Training split {spliti + 2} of {len(data_splits)}: {split}")
-        grid_point_result = task_predictions_train(
-            embedding_path=embedding_path,
-            embedding_size=embedding_size,
-            metadata=metadata,
-            data_splits=split,
-            label_to_idx=label_to_idx,
-            nlabels=nlabels,
-            scores=scores,
-            conf=best_grid_point.conf,
-            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-            gpus=gpus,
-            in_memory=in_memory,
-            deterministic=deterministic,
-            task=metadata["prediction_type"],
-        )
-        split_grid_points.append(grid_point_result)
-        logger.info(
-            f"Validation Score for the Training Split: "
-            f"{grid_point_result.validation_score}"
-        )
-
-    # Now test each of the trained models
-    test_results = {}
-    for i, split in enumerate(data_splits):
-        test_fold_str = "|".join(split["test"])
-        test_results[test_fold_str] = task_predictions_test(
-            embedding_path=embedding_path,
-            grid_point=split_grid_points[i],
-            metadata=metadata,
-            data_splits=split,
-            label_to_idx=label_to_idx,
-            nlabels=nlabels,
-            in_memory=in_memory,
-            task=metadata["prediction_type"],
-        )
-
-        # Cache predictions for detailed analysis
-        prediction_file = embedding_path.joinpath(f"{test_fold_str}.predictions.pkl")
-        with open(prediction_file, "wb") as fp:
-            pickle.dump(split_grid_points[i].predictor.test_predictions, fp)
-
-        # Add model training values relevant to this split model
-        test_results[test_fold_str].update(
-            {
-                "validation_score": split_grid_points[i].validation_score,
-                "epoch": split_grid_points[i].epoch,
-                "time_in_min": split_grid_points[i].time_in_min,
-            }
-        )
-
-    # Make sure we have a test score for each fold
-    assert len(test_results) == len(data_splits)
-
-    # Aggregate scores over folds
-    if len(test_results) > 1:
-        test_results["aggregated_scores"] = aggregate_test_results(test_results)
-
-    # Update test results with values relevant for all split models
-    test_results.update(
-        {
-            "hparams": hparams_to_json(best_grid_point.hparams),
-            "postprocessing": best_grid_point.postprocessing,
-            "score_mode": split_grid_points[i].score_mode,
-            "embedding_path": str(embedding_path),
-        }
-    )
-
-    # Save test scores
-    open(embedding_path.joinpath("test.predicted-scores.json"), "wt").write(
-        json.dumps(test_results, indent=4)
-    )
-    logger.info(f"Final Test Results: {json.dumps(test_results)}")
-
-    # We no longer have best_predictor, the predictor is
-    # loaded by trainer.test and then disappears
-    """
-    # Cache predictions for secondary sanity-check evaluation
-    if metadata["embedding_type"] == "event":
-        json.dump(
-            best_predictor.test_predicted_events,
-            embedding_path.joinpath("test.predictions.json").open("w"),
-            indent=4,
-        )
-    pickle.dump(
-        best_predictor.test_predicted_labels,
-        open(embedding_path.joinpath("test.predicted-labels.pkl"), "wb"),
-    )
+    See https://tut-arg.github.io/sed_eval/sound_event.html#sed_eval.sound_event.SegmentBasedMetrics # noqa: E501
+    for params.
     """
 
+    score_class = sed_eval.sound_event.SegmentBasedMetrics
 
-# This is for the RIR localization predictions.
-def rir_localization_predictions(
-    embedding_path: Path,
-    embedding_size: int,
-    grid_points: int,
-    gpus: Optional[int],
-    in_memory: bool,
-    deterministic: bool,
-    grid: str,
-    logger: logging.Logger,
-    prediction_type: str,
-    random_probe: bool,
-):
-    # We keep the determinisim always for our tasks.
-    if deterministic:
-        seed_everything(42, workers=True)
 
-    # This metadata is important for the normal task, but for RIR we need to change it up a bit.
-    metadata = json.load(embedding_path.joinpath("task_metadata.json").open())
-    metadata["prediction_type"] = prediction_type
-    # We do not have labels, so passy a dummy label_to_idx variable.
-    scores = [
-        available_scores[score](label_to_idx=dict(), maximize=False)
-        for score in metadata["evaluation"]
-    ]
+class EventBasedScore(SoundEventScore):
+    """
+    event-based scores - the ground truth and system output are compared at
+    event instance level;
 
-    use_scoring_for_early_stopping = metadata.get(
-        "use_scoring_for_early_stopping", True
-    )
+    See https://tut-arg.github.io/sed_eval/generated/sed_eval.sound_event.EventBasedMetrics.html # noqa: E501
+    for params.
+    """
 
-    # Data splits for training
-    data_splits = get_splits_from_metadata(metadata)
+    score_class = sed_eval.sound_event.EventBasedMetrics
 
-    # Construct the grid points for model creation
-    if grid == "default":
-        final_grid = copy.copy(PARAM_GRID)
-    elif grid == "fast":
-        final_grid = copy.copy(FAST_PARAM_GRID)
-    elif grid == "faster":
-        final_grid = copy.copy(FASTER_PARAM_GRID)
-    else:
-        raise ValueError(
-            f"Unknown grid type: {grid}. Please select default, fast, or faster"
-        )
 
-    # Update with task specific grid parameters
-    # From the global TASK_SPECIFIC_PARAM_GRID
-    if metadata["task_name"] in TASK_SPECIFIC_PARAM_GRID:
-        final_grid.update(TASK_SPECIFIC_PARAM_GRID[metadata["task_name"]])
+class MeanAveragePrecision(ScoreFunction):
+    """
+    Average Precision is calculated in macro mode which calculates
+    AP at a class level followed by macro-averaging across the classes.
+    """
 
-    # From task specific parameter grid in the task metadata
-    # We add this option, so that task specific param grid can be used
-    # for secret tasks, without mentioning them in the global
-    # TASK_SPECIFIC_PARAM_GRID. Ideally one out of the two option should be
-    # there
-    if "task_specific_param_grid" in metadata.get("evaluation_params", {}):
-        final_grid.update(metadata["evaluation_params"]["task_specific_param_grid"])
+    name = "mAP"
 
-    # Model selection
-    confs = list(ParameterGrid(final_grid))
-    random.shuffle(confs)
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # One hot
 
-    grid_point_results = []
-    for confi, conf in tqdm(enumerate(confs[:grid_points]), desc="grid"):
-        logger.info(f"Grid point {confi + 1} of {grid_points}: {conf}")
-        grid_point_result = task_predictions_train(
-            embedding_path=embedding_path,
-            embedding_size=embedding_size,
-            metadata=metadata,
-            data_splits=data_splits[0],
-            label_to_idx=dict(),
-            nlabels=3,
-            scores=scores,
-            conf=conf,
-            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-            gpus=gpus,
-            in_memory=in_memory,
-            deterministic=deterministic,
-            task=metadata["prediction_type"],
-            random_probe=random_probe,
-        )
-        logger.info(f" result: {grid_point_result}")
-        grid_point_results.append(grid_point_result)
-        print_scores(grid_point_results, embedding_path, logger)
+        """
+        Based on suggestions from Eduardo Fonseca -
+        Equal weighting is assigned to each class regardless
+        of its prior, which is commonly referred to as macro
+        averaging, following Hershey et al. (2017); Gemmeke et al.
+        (2017).
+        This means that rare classes are as important as common
+        classes.
 
-    # Use the best hyperparameters to train models for remaining folds,
-    # then compute test scores using the resulting models
-    grid_point_results = sort_grid_points(grid_point_results)
-    best_grid_point = grid_point_results[0]
-    logger.info(
-        "Best Grid Point Validation Score: "
-        f"{best_grid_point.validation_score}  "
-        "Grid Point HyperParams: "
-        f"{best_grid_point.hparams}  "
-    )
+        Issue with average_precision_score, when all ground truths are negative
+        https://github.com/scikit-learn/scikit-learn/issues/8245
+        This might come up in small tasks, where few samples are available
+        """
+        return average_precision_score(targets, predictions, average="macro")
 
-    # Train predictors for the remaining splits using the hyperparameters selected
-    # from the grid search.
-    split_grid_points = [best_grid_point]
-    for spliti, split in tqdm(enumerate(data_splits[1:]), desc="split"):
-        logger.info(f"Training split {spliti + 2} of {len(data_splits)}: {split}")
-        grid_point_result = task_predictions_train(
-            embedding_path=embedding_path,
-            embedding_size=embedding_size,
-            metadata=metadata,
-            data_splits=split,
-            label_to_idx=dict(),
-            nlabels=3,
-            scores=scores,
-            conf=best_grid_point.conf,
-            use_scoring_for_early_stopping=use_scoring_for_early_stopping,
-            gpus=gpus,
-            in_memory=in_memory,
-            deterministic=deterministic,
-            task=metadata["prediction_type"],
-            random_probe=random_probe,
-        )
-        split_grid_points.append(grid_point_result)
-        logger.info(
-            f"Validation Score for the Training Split: "
-            f"{grid_point_result.validation_score}"
-        )
 
-    # Now test each of the trained models
-    test_results = {}
-    for i, split in enumerate(data_splits):
-        test_fold_str = "|".join(split["test"])
-        test_results[test_fold_str] = task_predictions_test(
-            embedding_path=embedding_path,
-            grid_point=split_grid_points[i],
-            metadata=metadata,
-            data_splits=split,
-            label_to_idx=dict(),
-            nlabels=3,
-            in_memory=in_memory,
-            task=metadata["prediction_type"],
-        )
+class DPrime(ScoreFunction):
+    """
+    DPrime is calculated per class followed by averaging across the classes
 
-        prediction_file = embedding_path.joinpath(
-            f"{test_fold_str}.predictions-localization.pkl"
-        )
-        with open(prediction_file, "wb") as fp:
-            pickle.dump(split_grid_points[i].predictor.test_predictions, fp)
+    Code adapted from code provided by Eduoard Fonseca.
+    """
 
-        # Add model training values relevant to this split model
-        test_results[test_fold_str].update(
-            {
-                "validation_score": split_grid_points[i].validation_score,
-                "epoch": split_grid_points[i].epoch,
-                "time_in_min": split_grid_points[i].time_in_min,
-            }
-        )
+    name = "d_prime"
 
-    # Make sure we have a test score for each fold
-    assert len(test_results) == len(data_splits)
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # One hot
+        # ROC-AUC Requires more than one example for each class
+        # This might fail for data in small instances, so putting this in try except
+        try:
+            auc = roc_auc_score(targets, predictions, average=None)
 
-    # Aggregate scores over folds
-    if len(test_results) > 1:
-        test_results["aggregated_scores"] = aggregate_test_results(test_results)
+            d_prime = stats.norm().ppf(auc) * np.sqrt(2.0)
+            # Calculate macro score by averaging over the classes,
+            # see `MeanAveragePrecision` for reasons
+            d_prime_macro = np.mean(d_prime)
+            return d_prime_macro
+        except ValueError:
+            return np.nan
 
-    # Update test results with values relevant for all split models
-    test_results.update(
-        {
-            "hparams": hparams_to_json(best_grid_point.hparams),
-            "postprocessing": best_grid_point.postprocessing,
-            "score_mode": split_grid_points[i].score_mode,
-            "embedding_path": str(embedding_path),
-        }
-    )
 
-    # Save test scores
-    if random_probe:
-        open(embedding_path.joinpath("test.predicted-scores-random.json"), "wt").write(
-            json.dumps(test_results, indent=4)
-        )
-    else:
-        open(
-            embedding_path.joinpath("test.predicted-scores-localization.json"), "wt"
-        ).write(json.dumps(test_results, indent=4))
-    logger.info(f"Final Test Results: {json.dumps(test_results)}")
+class AUCROC(ScoreFunction):
+    """
+    AUCROC (macro mode) is calculated per class followed by averaging across the
+    classes
+    """
+
+    name = "aucroc"
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # One hot
+        # ROC-AUC Requires more than one example for each class
+        # This might fail for data in small instances, so putting this in try except
+        try:
+            # Macro mode auc-roc. Please check `MeanAveragePrecision`
+            # for the reasoning behind using using macro mode
+            auc = roc_auc_score(targets, predictions, average="macro")
+            return auc
+        except ValueError:
+            return np.nan
+
+
+class SourceLocal(ScoreFunction):
+    """
+    3D Source Localization Error
+    """
+
+    name = "3d_source_local"
+    maximize = False
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        assert predictions.ndim == 2 and targets.ndim == 2
+        assert predictions.shape == targets.shape
+
+        # Compute per-sample Euclidean distance
+        mean_error = np.abs(predictions - targets).mean()
+        return float(mean_error)
+
+
+class SourceLocalX(ScoreFunction):
+    """
+    3D Source Localization Error
+    """
+
+    name = "3d_source_local_x"
+    maximize = False
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        # For each datapoint we predict X,Y,Z coordinate.
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # X,Y,Z coordiante of the source
+        try:
+            # Mean source localization
+            source_localization_error = np.abs(
+                np.subtract(predictions[..., 0], targets[..., 0])
+            ).mean()
+            return float(source_localization_error)
+        except ValueError:
+            return np.nan
+
+
+class SourceLocalY(ScoreFunction):
+    """
+    3D Source Localization Error
+    """
+
+    name = "3d_source_local_y"
+    maximize = False
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        # For each datapoint we predict X,Y,Z coordinate.
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # X,Y,Z coordiante of the source
+        try:
+            # Mean source localization
+            source_localization_error = np.abs(
+                np.subtract(predictions[..., 1], targets[..., 1])
+            ).mean()
+            return float(source_localization_error)
+        except ValueError:
+            return np.nan
+
+
+class SourceLocalZ(ScoreFunction):
+    """
+    3D Source Localization Error
+    """
+
+    name = "3d_source_local_z"
+    maximize = False
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        # For each datapoint we predict X,Y,Z coordinate.
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # X,Y,Z coordiante of the source
+        try:
+            # Mean source localization
+            source_localization_error = np.abs(
+                np.subtract(predictions[..., 2], targets[..., 2])
+            ).mean()
+            return float(source_localization_error)
+        except ValueError:
+            return np.nan
+
+
+class DOE(ScoreFunction):
+    """
+    3D Source Localization Error W.R.T Direction of Arrivial Estimation.
+    """
+
+    name = "DOE"
+    maximize = False
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        # For each datapoint we predict X,Y,Z coordinate.
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # X,Y,Z coordiante of the source
+        try:
+            # Mean source localization
+            pred_az_rad, pred_el_rad = cartesian_to_spherical(
+                predictions[..., 0], predictions[..., 1], predictions[..., 2]
+            )
+            target_az_rad, target_el_rad = cartesian_to_spherical(
+                targets[..., 0], targets[..., 1], targets[..., 2]
+            )
+
+            # Calculate the angular distance (great circle distance)
+            # cos(angular_distance) = sin(el1)*sin(el2) + cos(el1)*cos(el2)*cos(az1-az2)
+            cos_dist = np.sin(target_el_rad) * np.sin(pred_el_rad) + np.cos(
+                target_el_rad
+            ) * np.cos(pred_el_rad) * np.cos(target_az_rad - pred_az_rad)
+
+            # Clip to handle floating point errors
+            cos_dist = np.clip(cos_dist, -1.0, 1.0)
+
+            # Convert back to degrees
+            angular_dist = np.rad2deg(np.arccos(cos_dist))
+            source_localization_error = np.median(angular_dist)
+            return float(source_localization_error)
+        except ValueError as e:
+            print(e)
+            return 0.0
+
+
+class DOA(ScoreFunction):
+    """
+    3D Source Localization Error W.R.T Direction of Arrivial Estimation.
+    """
+
+    name = "DOA"
+    maximize = False
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        # For each datapoint we predict X,Y,Z coordinate.
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # X,Y,Z coordiante of the source
+        try:
+            sqrt_pred_error = np.sqrt(np.sum((targets - predictions) ** 2, axis=1))
+            source_localization_error = (
+                2 * np.arcsin(sqrt_pred_error / 2) * (180 / np.pi)
+            )
+            source_localization_error = np.nan_to_num(source_localization_error, 180)
+            return float(source_localization_error.mean())
+        except ValueError as e:
+            print(e)
+            return 180
+
+
+class MeanAngularError(ScoreFunction):
+    """
+    3D Source Localization Error W.R.T Direction of Arrivial Estimation.
+    """
+
+    name = "MAE"
+    maximize = False
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        # For each datapoint we predict X,Y,Z coordinate.
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # X,Y,Z coordiante of the source
+        try:
+            # Normalize each row vector separately
+            targets_normalized = targets / np.linalg.norm(
+                targets, axis=1, keepdims=True
+            )
+            predictions_normalized = predictions / np.linalg.norm(
+                predictions, axis=1, keepdims=True
+            )
+
+            # Compute dot product between corresponding vectors
+            dot_products = np.sum(targets_normalized * predictions_normalized, axis=1)
+
+            # Clip values to valid arccos domain to avoid numerical issues
+            dot_products = np.clip(dot_products, -1.0, 1.0)
+
+            # Calculate angular error in radians
+            source_localization_error = np.arccos(dot_products) * (180.0 / np.pi)
+
+            return float(source_localization_error.mean())
+        except ValueError as e:
+            print(e)
+            return 180
+
+
+class Distance(ScoreFunction):
+    """
+    Distance Error
+    """
+
+    name = "distance"
+    maximize = False
+
+    def _compute(self, predictions: np.ndarray, targets: np.ndarray, **kwargs) -> float:
+        assert predictions.ndim == 2
+        assert targets.ndim == 2  # One hot
+        # ROC-AUC Requires more than one example for each class
+        # This might fail for data in small instances, so putting this in try except
+        try:
+            # Macro mode auc-roc. Please check `MeanAveragePrecision`
+            # for the reasoning behind using using macro mode
+            predictions = np.sqrt(np.power(predictions, 2).sum(axis=1))
+            targets = np.sqrt(np.power(targets, 2).sum(axis=1))
+            r_error = (np.abs(predictions - targets)).mean()
+            return float(r_error)
+        except ValueError as e:
+            print(e)
+            return np.nan
+
+
+available_scores: Dict[str, Callable] = {
+    "top1_acc": Top1Accuracy,
+    "pitch_acc": partial(Top1Accuracy, name="pitch_acc"),
+    "chroma_acc": ChromaAccuracy,
+    # https://tut-arg.github.io/sed_eval/generated/sed_eval.sound_event.EventBasedMetrics.html
+    "event_onset_200ms_fms": partial(
+        EventBasedScore,
+        name="event_onset_200ms_fms",
+        # If first score will be used as the primary score for this metric
+        scores=("f_measure", "precision", "recall"),
+        params={"evaluate_onset": True, "evaluate_offset": False, "t_collar": 0.2},
+    ),
+    "event_onset_50ms_fms": partial(
+        EventBasedScore,
+        name="event_onset_50ms_fms",
+        scores=("f_measure", "precision", "recall"),
+        params={"evaluate_onset": True, "evaluate_offset": False, "t_collar": 0.05},
+    ),
+    "event_onset_offset_50ms_20perc_fms": partial(
+        EventBasedScore,
+        name="event_onset_offset_50ms_20perc_fms",
+        scores=("f_measure", "precision", "recall"),
+        params={
+            "evaluate_onset": True,
+            "evaluate_offset": True,
+            "t_collar": 0.05,
+            "percentage_of_length": 0.2,
+        },
+    ),
+    "segment_1s_er": partial(
+        SegmentBasedScore,
+        name="segment_1s_er",
+        scores=("error_rate", ""),
+        params={"time_resolution": 1.0},
+        maximize=False,
+    ),
+    'SELD': partial(
+        SELD,
+        name="SELD",
+        scores=("SELD", "ER", "F", "LE", "LR"),
+        params= {"nb_classes": 8, "doa_threshold": 50, "average": "macro"},
+        maximize=False,
+    ),
+    "mAP": MeanAveragePrecision,
+    "d_prime": DPrime,
+    "aucroc": AUCROC,
+    "3d_source_local": SourceLocal,
+    "3d_source_local_x": SourceLocalX,
+    "3d_source_local_y": SourceLocalY,
+    "3d_source_local_z": SourceLocalZ,
+    "DOE": DOE,
+    "DOA": DOA,
+    "MAE": MeanAngularError,
+    "distance": Distance,
+}
