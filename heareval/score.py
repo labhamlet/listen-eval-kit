@@ -672,19 +672,17 @@ class SELD(ScoreFunction):
     def _compute(self,
         pred_dicts,
         ref_dicts,
-        pred_nb_label_frames_1s,
-        ref_nb_label_frames_1s) -> Tuple[Tuple[str, float], ...]:
+        _nb_label_frames_1s) -> Tuple[Tuple[str, float], ...]:
         
         overall_scores = {}
 
         eval = SELDMetrics(nb_classes=self.params["nb_classes"], doa_threshold=self.params["doa_threshold"], average=self.params["average"])
         for file_name in pred_dicts.keys():
-            pred_dict = pred_dicts[file_name][0]
-            print(pred_dict)
-            print(ref_dicts[file_name][0])
-            pred_labels = segment_labels(pred_dict, ref_dicts[file_name][1], _nb_label_frames_1s=pred_nb_label_frames_1s)
-            ref_labels = pred_labels = segment_labels(ref_dicts[file_name][0], ref_dicts[file_name][1], _nb_label_frames_1s=ref_nb_label_frames_1s)
-            # Calculated scores
+            pred_dict = pred_dicts[file_name]
+            ref_dict = ref_dicts[file_name]
+            nb_ref_frames = max(list(ref_dict.keys()))
+            pred_labels = segment_labels(pred_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
+            ref_labels = pred_labels = segment_labels(ref_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
             eval.update_seld_scores(pred_labels, ref_labels)
 
         # Overall SED and DOA scores

@@ -538,15 +538,14 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 label_to_idx=self.label_to_idx
             )
             #The time-stamp interval that model produces time-stamps
-            pred_timestamp_per_second = int(1000 // diff)
-            ref_timestamp_per_second = pred_timestamp_per_second if self.source == "static" else self.ref_timestamp_per_second
+            _nb_pred_frames_1s = int(1000 // diff)
+            _nb_label_frames_1s = _nb_pred_frames_1s if self.source == "static" else self._nb_label_frames_1s
 
             primary_score_fn = self.scores[0]
             primary_score_ret = primary_score_fn(
                     pred_events,
                     ref_events,
-                    pred_timestamp_per_second,
-                    ref_timestamp_per_second,
+                    _nb_label_frames_1s,
             )
             if isinstance(primary_score_ret, tuple):
                 primary_score = primary_score_ret[0][1]
@@ -582,19 +581,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         self, epoch: int
     ) -> Tuple[Tuple[str, Any], ...]:
         return None
-
-        # if self.use_scoring_for_early_stopping:
-        #     if int(epoch) not in self.epoch_best_postprocessing:
-        #         print(f"Got key {int(epoch)}, this is not in {self.epoch_best_postprocessing.keys()}, returning the last epoch")
-        #         return self.epoch_best_postprocessing[int(epoch)- 1]
-        #     else:
-        #         return self.epoch_best_postprocessing[int(epoch)]
-        # else:
-        #     postprocessing_confs = list(ParameterGrid(self.postprocessing_grid))
-        #     # There can only be one kind of postprocessing
-        #     assert len(postprocessing_confs) == 1
-        #     return tuple(postprocessing_confs[0].items())
-
 
 
 class EventPredictionModel(AbstractPredictionModel):
@@ -880,6 +866,130 @@ class SplitMemmapDataset(Dataset):
             return self.embeddings[idx], self.y[idx], self.metadata[idx]
 
 
+def get_ref_accdoa_events(
+    references: torch.Tensor,
+    filenames: List[str],
+    ref_timestamps: Dict[str, List[float]],
+    nb_classes: int, 
+    label_to_idx : Dict[str, int] = None
+) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
+
+    #This event dict has to contain file_names as key and the values should be frame_ind : [[detected_class_idx_1, 0, x, y, z, 0], [detected_class_idx_2, 0, x, y, z, 0]]
+    #First key is the filename, and the second key in the dict is the frame_idx.    
+    event_dict: Dict[
+        str, Dict[int, List[List[int | float]]]
+    ] = {}
+
+    for filename in filenames:
+        # Loads from the test/valid folds.
+        # Get the timestamp for the ref_timestamps, and map it into ACCDOA style?
+        assert sorted(ref_timestamps[os.path.basename(filename)]) == ref_timestamps[os.path.basename(filename)], f"Timestamps for {filename} is not sorted!"
+        for timestamp_idx, timestamp in enumerate(ref_timestamps[os.path.basename(filename)]):
+          events = references[os.path.basename(filename)][timestamp_idx]
+          if len(events) != 0: #If there is an active event
+            for event in events:
+              class_str = event[0]
+              doa_tuple = event[1]   
+              class_idx = label_to_idx[str(class_str)]
+              if filename not in event_dict:
+                event_dict[filename] = {}
+              if timestamp_idx not in event_dict[filename]:
+                event_dict[filename][timestamp_idx] = []
+              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1]), float(doa_tuple[2]), 0])
+
+    return event_dict
+
+def get_accdoa_events(
+    predictions: torch.Tensor,
+    filenames: List[str],
+    timestamps,
+    nb_classes: int, 
+) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
+    """
+    Produces lists of events from a set of frame based label accdoas.
+    The input prediction tensor may contain frame predictions from a set of different
+    files concatenated together. file_timestamps has a list of filenames and
+    timestamps for each frame in the predictions tensor.
+
+    We split the predictions into separate tensors based on the filename and compute
+    events based on those individually.
+
+    If no postprocessing is specified (during training), we try a
+    variety of ways of postprocessing the predictions into events,
+    from the postprocessing_grid including median filtering and
+    minimum event length.
+
+
+    Args:
+        predictions: a tensor of frame based multi-label predictions.
+        filenames: a list of filenames where each entry corresponds
+            to a frame in the predictions tensor.
+        timestamps: a list of timestamps where each entry corresponds
+            to a frame in the predictions tensor.
+        idx_to_label: Index to label mapping.
+        postprocessing: See above.
+
+    Returns:
+        A dictionary from filtering params to the following values:
+        A dictionary of lists of events keyed on the filename slug.
+        The event list is of dicts of the following format:
+            {"label": str, "start": float ms, "end": float ms}
+    """
+    #Event files with filename_Dict.
+    event_files: Dict[str, Dict[int, torch.Tensor]] = {}
+    for timestamp_idx, (filename, timestamp) in tqdm(enumerate(zip(filenames, timestamps))):
+        slug = Path(filename).name
+        if slug not in event_files:
+          event_files[slug] = {}
+        #Get the ACCDOA predictions for the timestamp.
+        event_files[slug][float(timestamp)] = predictions[timestamp_idx]
+
+
+    #This event dict has to contain file_names as key and the values should be frame_ind : [[detected_class_idx_1, 0, x, y, z, 0], [detected_class_idx_2, 0, x, y, z, 0]]
+    #First key is the filename, and the second key in the dict is the frame_idx.    
+    event_dict: Dict[
+        str, Dict[int, List[List[int | float]]]
+    ] = {}
+    
+    for file_name in tqdm(event_files.keys()):
+        accdoa_dict, diff = get_accdoa_labels(event_files[file_name], nb_classes)
+        event_dict[file_name] = accdoa_dict
+
+    return event_dict, diff
+
+
+def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
+    """
+    Extracts SED labels and coordinates from ACCDOA format.
+    
+    Returns:
+        sed: Boolean array (Total_Frames, nb_classes). Active if magnitude > 0.5.
+        accdoa_vectors: Array (Total_Frames, nb_classes, 3). Format [x, y, z].
+        frame_interval: Float (time difference between frames) or Default 0.02.
+    """
+    
+    # 1. Handle Input (Dict vs Tensor) & Timestamps
+    timestamps = sorted(accdoa_in.keys())
+    predictions_list = [accdoa_in[t] for t in timestamps]
+    #Predictions per timestamp (actually frame)
+    accdoa_vectors = np.stack(predictions_list)
+    predictions = {} 
+    for time_frame in range(len(accdoa_vectors)):
+        timestamp_prediction = accdoa_vectors[time_frame] 
+        x = timestamp_prediction[:, 0]
+        y = timestamp_prediction[:, 1]
+        z = timestamp_prediction[:, 2]
+        sed_magnitude = np.sqrt(x**2 + y**2 + z**2)
+        sed = np.where(sed_magnitude > 0.5)[0]
+        if time_frame not in predictions: 
+            predictions[time_frame] = [] 
+        #For each predicted class, append the class index and float to the predictions
+        for class_idx in sed:
+            predictions[time_frame].append([int(class_idx), 0, float(x[class_idx]), float(y[class_idx]), float(z[class_idx]), 0.0])
+
+    return predictions, np.mean(np.diff(np.array(timestamps)))
+
+
 def create_events_from_prediction(
     prediction_dict: Dict[float, torch.Tensor],
     idx_to_label: Dict[int, str],
@@ -949,226 +1059,6 @@ def create_events_from_prediction(
     # This is just for pretty output, not really necessary
     events.sort(key=lambda k: k["start"])
     return events
-
-
-def get_ref_accdoa_events(
-    references: torch.Tensor,
-    filenames: List[str],
-    ref_timestamps: Dict[str, List[float]],
-    nb_classes: int, 
-    label_to_idx : Dict[str, int] = None
-) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
-    """
-    Produces lists of events from a set of frame based label accdoas.
-    The input prediction tensor may contain frame predictions from a set of different
-    files concatenated together. file_timestamps has a list of filenames and
-    timestamps for each frame in the predictions tensor.
-
-    We split the predictions into separate tensors based on the filename and compute
-    events based on those individually.
-
-    If no postprocessing is specified (during training), we try a
-    variety of ways of postprocessing the predictions into events,
-    from the postprocessing_grid including median filtering and
-    minimum event length.
-
-
-    Args:
-        predictions: a tensor of frame based multi-label predictions.
-        filenames: a list of filenames where each entry corresponds
-            to a frame in the predictions tensor.
-        timestamps: a list of timestamps where each entry corresponds
-            to a frame in the predictions tensor.
-        idx_to_label: Index to label mapping.
-        postprocessing: See above.
-
-    Returns:
-        A dictionary from filtering params to the following values:
-        A dictionary of lists of events keyed on the filename slug.
-        The event list is of dicts of the following format:
-            {"label": str, "start": float ms, "end": float ms}
-    """
-    # This probably could be more efficient if we make the assumption that
-    # timestamps are in sorted order. But this makes sure of it.
-    # This probably could be more efficient if we make the assumption that
-    # timestamps are in sorted order. But this makes sure of it.
-    event_files: Dict[str, Dict[int, torch.Tensor]] = {}
-    for filename in filenames:
-        slug = Path(filename).name
-        if slug not in event_files:
-          event_files[slug] = {}
-          # Loads from the test/valid folds.
-        for timestamp_idx, timestamp in enumerate(ref_timestamps[os.path.basename(filename)]):
-          y = torch.zeros([nb_classes, 3])
-          events = references[os.path.basename(filename)][timestamp_idx]
-          if len(events) != 0: #If there is an active event
-            active_classes = []
-            active_doas = []
-            for event in events:
-              class_str = event[0]
-              doa_tuple = event[1]   
-              class_idx = label_to_idx[str(class_str)]
-              y[class_idx] = torch.tensor(doa_tuple).float()
-          
-          event_files[slug][float(timestamp)] = y
-
-    event_dict: Dict[
-        Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[float, str]]]]
-    ] = {}
-
-
-    for file_name in tqdm(event_files.keys()):
-        sed_pred, doa_pred, _ = get_accdoa_labels(event_files[file_name], nb_classes)
-        accdoa_dict = create_accdoa_events_from_prediction(
-            sed_pred, doa_pred, 
-        )
-        max_frames = max(list(accdoa_dict.keys()))
-        event_dict[slug] = [accdoa_dict, max_frames]
-
-    return event_dict
-
-def get_accdoa_events(
-    predictions: torch.Tensor,
-    filenames: List[str],
-    timestamps,
-    nb_classes: int, 
-) -> Dict[Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[str, float]]]]]:
-    """
-    Produces lists of events from a set of frame based label accdoas.
-    The input prediction tensor may contain frame predictions from a set of different
-    files concatenated together. file_timestamps has a list of filenames and
-    timestamps for each frame in the predictions tensor.
-
-    We split the predictions into separate tensors based on the filename and compute
-    events based on those individually.
-
-    If no postprocessing is specified (during training), we try a
-    variety of ways of postprocessing the predictions into events,
-    from the postprocessing_grid including median filtering and
-    minimum event length.
-
-
-    Args:
-        predictions: a tensor of frame based multi-label predictions.
-        filenames: a list of filenames where each entry corresponds
-            to a frame in the predictions tensor.
-        timestamps: a list of timestamps where each entry corresponds
-            to a frame in the predictions tensor.
-        idx_to_label: Index to label mapping.
-        postprocessing: See above.
-
-    Returns:
-        A dictionary from filtering params to the following values:
-        A dictionary of lists of events keyed on the filename slug.
-        The event list is of dicts of the following format:
-            {"label": str, "start": float ms, "end": float ms}
-    """
-    # This probably could be more efficient if we make the assumption that
-    # timestamps are in sorted order. But this makes sure of it.
-    event_files: Dict[str, Dict[int, torch.Tensor]] = {}
-    for timestamp_idx, (filename, timestamp) in tqdm(enumerate(zip(filenames, timestamps))):
-        slug = Path(filename).name
-        if slug not in event_files:
-          event_files[slug] = {}
-        event_files[slug][float(timestamp)] = predictions[timestamp_idx]
-
-    event_dict: Dict[
-        Tuple[Tuple[str, Any], ...], Dict[str, List[Dict[str, Union[float, str]]]]
-    ] = {}
-
-
-    for file_name in tqdm(event_files.keys()):
-        sed_pred, doa_pred, diff = get_accdoa_labels(event_files[file_name], nb_classes)
-        accdoa_dict = create_accdoa_events_from_prediction(
-            sed_pred, doa_pred       
-            )
-        max_frames = max(list(accdoa_dict.keys()))
-        event_dict[slug] = [accdoa_dict, max_frames]
-
-    return event_dict, diff
-
-
-def get_accdoa_labels(accdoa_in, nb_classes):
-    """
-    Extracts SED labels and coordinates from ACCDOA format.
-    
-    Returns:
-        sed: Boolean array (Total_Frames, nb_classes). Active if magnitude > 0.5.
-        accdoa_vectors: Array (Total_Frames, nb_classes, 3). Format [x, y, z].
-        frame_interval: Float (time difference between frames) or Default 0.02.
-    """
-    
-    # 1. Handle Input (Dict vs Tensor) & Timestamps
-    timestamps = None
-
-    if isinstance(accdoa_in, dict):
-        timestamps = sorted(accdoa_in.keys())
-        predictions = [accdoa_in[t] for t in timestamps]
-      
-        
-        # Detach if necessary
-        if torch.is_tensor(predictions[0]):
-            predictions = [p.detach().cpu().numpy() for p in predictions]
-        accdoa_vectors = np.concatenate(predictions, axis=0)
-        
-    elif torch.is_tensor(accdoa_in):
-        accdoa_vectors = accdoa_in.detach().cpu().numpy()
-    else:
-        accdoa_vectors = accdoa_in
-
-    accdoa_vectors = accdoa_vectors.reshape(-1, 3, nb_classes)
-    accdoa_vectors = accdoa_vectors.transpose(0, 2, 1)
-
-    x = accdoa_vectors[:, :, 0]
-    y = accdoa_vectors[:, :, 1]
-    z = accdoa_vectors[:, :, 2]
-
-    # 4. Calculate SED (Active if vector magnitude > 0.5)
-    sed_magnitude = np.sqrt(x**2 + y**2 + z**2)
-    sed = sed_magnitude > 0.5
-
-      
-    return sed, accdoa_vectors, np.mean(np.diff(np.array(timestamps)))
-
-def create_accdoa_events_from_prediction(
-    sed_pred: np.array,
-    doa_pred: np.array
-) -> Dict[int, List[list]]:
-    """
-    Generates a dictionary of active events per frame.
-    
-    Args:
-        sed_pred: Boolean or Float array of shape (Frames, Classes).
-        doa_pred: Coordinate array of shape (Frames, Classes, 3) [x, y, z].
-        
-    Returns:
-        output_dict: { frame_idx: [[class_idx, x, y, z], ...] }
-    """
-    output_dict = {}
-    
-    # Ensure sed_pred is boolean (in case raw probabilities were passed)
-    is_active = sed_pred > 0.5 if sed_pred.dtype != bool else sed_pred
-
-    # Iterate through frames
-    for frame_cnt in range(sed_pred.shape[0]):
-        active_classes = []
-        
-        # Iterate through classes
-        for class_cnt in range(sed_pred.shape[1]):
-            # If this class is active in this frame
-            if is_active[frame_cnt, class_cnt]:
-                # Get the [x, y, z] vector
-                coords = doa_pred[frame_cnt, class_cnt]
-                
-                # Append [class_idx, x, y, z]
-                active_classes.append([class_cnt, coords[0], coords[1], coords[2]])
-        
-        # Only add to dictionary if there are active events in this frame
-        if active_classes:
-            output_dict[frame_cnt] = active_classes
-            
-    return output_dict
-
 
 
 def get_events_for_all_files(
