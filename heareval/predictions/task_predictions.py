@@ -535,7 +535,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             else:
                 ref_events = get_ref_accdoa_events(
                     self.target_events[name],             
-                    filename,
                     self.target_timestamps[name],
                     self.nlabels,
                     label_to_idx=self.label_to_idx
@@ -851,7 +850,6 @@ class SplitMemmapDataset(Dataset):
 
 def get_ref_accdoa_events(
     references: torch.Tensor,
-    filenames: List[str],
     ref_timestamps: Dict[str, List[float]],
     nb_classes: int, 
     label_to_idx : Dict[str, int] = None
@@ -863,7 +861,7 @@ def get_ref_accdoa_events(
         str, Dict[int, List[List[int | float]]]
     ] = {}
 
-    for filename in filenames:
+    for filename in ref_timestamps:
         filename = os.path.basename(filename)
         # Loads from the test/valid folds.
         # Get the timestamp for the ref_timestamps, and map it into ACCDOA style?
@@ -879,7 +877,7 @@ def get_ref_accdoa_events(
                 event_dict[filename] = {}
               if timestamp_idx not in event_dict[filename]:
                 event_dict[filename][timestamp_idx] = []
-              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1]), float(doa_tuple[2])])
+              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1]), float(doa_tuple[2]), 0])
 
     return event_dict
 
@@ -969,7 +967,7 @@ def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
             predictions[time_frame] = [] 
         #For each predicted class, append the class index and float to the predictions
         for class_idx in sed:
-            predictions[time_frame].append([int(class_idx), 0, float(x[class_idx]), float(y[class_idx]), float(z[class_idx])])
+            predictions[time_frame].append([int(class_idx), 0, float(x[class_idx]), float(y[class_idx]), float(z[class_idx]), 0])
 
     return predictions, np.mean(np.diff(np.array(timestamps)))
 
