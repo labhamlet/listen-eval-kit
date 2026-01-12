@@ -587,8 +587,8 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             self.log_scores(
                 name, score_args=(pred_events,
                     ref_events,
-                    pred_timestamp_per_second,
-                    ref_timestamp_per_second)
+                    _nb_label_frames_1s
+                    )
             )
         
     def epoch_best_postprocessing_or_default(
