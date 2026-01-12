@@ -58,8 +58,8 @@ TASK_SPECIFIC_PARAM_GRID = {
     "tau2018-ov1": {
         "check_val_every_n_epoch": [25]
     },
-    "tau2018-ov2": {
-        "check_val_every_n_epoch": [10],
+    "tau2018_ov2": {
+        "check_val_every_n_epoch": [25],
     },
     "tau2018-ov3": {
         "check_val_every_n_epoch": [25]

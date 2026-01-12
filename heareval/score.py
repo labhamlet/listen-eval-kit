@@ -35,7 +35,6 @@ def convert_output_format_cartesian_to_polar(in_dict):
                 elevation = np.arctan2(z, np.sqrt(x**2 + y**2)) * 180 / np.pi
                 r = np.sqrt(x**2 + y**2 + z**2)
                 out_dict[frame_cnt].append([tmp_val[0], tmp_val[1], azimuth, elevation])
-    print(out_dict)
     return out_dict
 
 
@@ -700,7 +699,6 @@ class SELD(ScoreFunction):
             nb_ref_frames = max(list(ref_dict.keys()))
             pred_labels = segment_labels(pred_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
             ref_labels = segment_labels(ref_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
-            print(file_name)
             eval.update_seld_scores(pred_labels, ref_labels)
 
         # Overall SED and DOA scores
