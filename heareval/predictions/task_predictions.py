@@ -530,13 +530,16 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         if name == "test" or self.use_scoring_for_early_stopping:
             #Here we get events for all files per filename.
             #TODO finish mapping this!
+            print("Pred events")
             pred_events, diff = get_accdoa_events(
                 prediction,
                 filename,
                 timestamp,
                 self.nlabels
             )
+            print("Pred_events done.")
             #Here we can get the events that have been cached for sure!
+            print("Ref events")
             if self.cached:
                 ref_events = self._retrieve_from_cache(
                     name
@@ -551,16 +554,19 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 )
                 self._cache(ref_events, name)
                 self.cached = True
+            print("Ref events done")
             #The time-stamp interval that model produces time-stamps
             _nb_pred_frames_1s = int(1000 // diff)
             _nb_label_frames_1s = _nb_pred_frames_1s if self.source == "static" else self._nb_label_frames_1s
 
             primary_score_fn = self.scores[0]
+            print("Scoring")
             primary_score_ret = primary_score_fn(
                     pred_events,
                     ref_events,
                     _nb_label_frames_1s,
             )
+            print("Scoring Done")
             if isinstance(primary_score_ret, tuple):
                 primary_score = primary_score_ret[0][1]
             elif isinstance(primary_score_ret, float):
