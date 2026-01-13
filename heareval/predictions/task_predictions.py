@@ -1488,43 +1488,36 @@ def task_predictions_train(
         random_probe=random_probe,
     )
     trainer.fit(predictor, train_dataloader, valid_dataloader)
-    try:
-      if checkpoint_callback.best_model_score is not None:
-          sys.stdout.flush()
-          end = time.time()
-          time_in_min = (end - start) / 60
-          epoch = torch.load(checkpoint_callback.best_model_path, weights_only = False)["epoch"]
-          print(f"Loaded epoch : {epoch}")
-          if metadata["embedding_type"] == "event":
-              best_postprocessing = predictor.epoch_best_postprocessing_or_default(epoch)
-          else:
-              best_postprocessing = []
-          # TODO: Postprocessing
-          logger.log_metrics({"time_in_min": time_in_min})
-          logger.finalize("success")
-          logger.save()
-          return GridPointResult(
-              predictor=predictor,
-              model_path=checkpoint_callback.best_model_path,
-              epoch=epoch,
-              time_in_min=time_in_min,
-              hparams=dict(predictor.hparams),
-              postprocessing=best_postprocessing,
-              trainer=trainer,
-              validation_score=checkpoint_callback.best_model_score.detach().cpu().item(),
-              score_mode=mode,
-              conf=conf,
-          )
-      else:
-          raise ValueError(
-              f"No score {checkpoint_callback.best_model_score} for this model"
-          )
-    except ValueError as e:
-      return e
-    finally:
-      del train_dataloader
-      del valid_dataloader
-      gc.collect()
+    if checkpoint_callback.best_model_score is not None:
+        sys.stdout.flush()
+        end = time.time()
+        time_in_min = (end - start) / 60
+        epoch = torch.load(checkpoint_callback.best_model_path, weights_only = False)["epoch"]
+        print(f"Loaded epoch : {epoch}")
+        if metadata["embedding_type"] == "event":
+            best_postprocessing = predictor.epoch_best_postprocessing_or_default(epoch)
+        else:
+            best_postprocessing = []
+        # TODO: Postprocessing
+        logger.log_metrics({"time_in_min": time_in_min})
+        logger.finalize("success")
+        logger.save()
+        return GridPointResult(
+            predictor=predictor,
+            model_path=checkpoint_callback.best_model_path,
+            epoch=epoch,
+            time_in_min=time_in_min,
+            hparams=dict(predictor.hparams),
+            postprocessing=best_postprocessing,
+            trainer=trainer,
+            validation_score=checkpoint_callback.best_model_score.detach().cpu().item(),
+            score_mode=mode,
+            conf=conf,
+        )
+    else:
+        raise ValueError(
+            f"No score {checkpoint_callback.best_model_score} for this model"
+        )
 
 
 def task_predictions_test(
@@ -1819,6 +1812,22 @@ def task_predictions(
         grid_point_results.append(grid_point_result)
         print_scores(grid_point_results, embedding_path, logger)
 
+        # Sort to find the current best result
+        sorted_results = sort_grid_points(grid_point_results)
+        best_current_result = sorted_results[0]
+
+        # Release memory for all models that are NOT the current best.
+        # This clears the Trainer -> DataLoader -> Dataset -> RAM reference chain.
+        for result in grid_point_results:
+            if result is not best_current_result:
+                result.trainer = None
+                result.predictor = None
+        
+        # Force Python's garbage collector to release the memory immediately
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     # Use the best hyperparameters to train models for remaining folds,
     # then compute test scores using the resulting models
     grid_point_results = sort_grid_points(grid_point_results)
@@ -1908,22 +1917,6 @@ def task_predictions(
     )
     logger.info(f"Final Test Results: {json.dumps(test_results)}")
 
-    # We no longer have best_predictor, the predictor is
-    # loaded by trainer.test and then disappears
-    """
-    # Cache predictions for secondary sanity-check evaluation
-    if metadata["embedding_type"] == "event":
-        json.dump(
-            best_predictor.test_predicted_events,
-            embedding_path.joinpath("test.predictions.json").open("w"),
-            indent=4,
-        )
-    pickle.dump(
-        best_predictor.test_predicted_labels,
-        open(embedding_path.joinpath("test.predicted-labels.pkl"), "wb"),
-    )
-    """
-
 
 # This is for the RIR localization predictions.
 def rir_localization_predictions(
@@ -2009,6 +2002,21 @@ def rir_localization_predictions(
         logger.info(f" result: {grid_point_result}")
         grid_point_results.append(grid_point_result)
         print_scores(grid_point_results, embedding_path, logger)
+
+        # Sort to find the current best result
+        sorted_results = sort_grid_points(grid_point_results)
+        best_current_result = sorted_results[0]
+
+        # Release memory for non-best models
+        for result in grid_point_results:
+            if result is not best_current_result:
+                result.trainer = None
+                result.predictor = None
+        
+        # Force garbage collection
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Use the best hyperparameters to train models for remaining folds,
     # then compute test scores using the resulting models
