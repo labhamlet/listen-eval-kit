@@ -832,8 +832,8 @@ class SplitMemmapDataset(Dataset):
                 for class_str, doa_tuple in zip(active_classes, active_doas):
                     # Convert string label to integer index
                     class_idx = self.label_to_idx[str(class_str)]
-                    x, y, z = convert_from_spherical_to_cart(doa_tuple[0], doa_tuple[1])
-                    y[class_idx] = torch.tensor([x,y,z]).float()
+                    x_cat, y_cat, z_cat = convert_from_spherical_to_cart(doa_tuple[0], doa_tuple[1])
+                    y[class_idx] = torch.tensor([x_cat,y_cat,z_cat]).float()
             else:
                 y = torch.tensor(self.labels[idx])
             ys.append(y)
