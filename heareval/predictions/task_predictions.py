@@ -11,6 +11,7 @@ TODO:
     * If disk speed is the limiting factor maybe we should train
     many models simultaneously with one disk read?
 """
+import gc
 import os
 import copy
 import json
@@ -55,8 +56,8 @@ TASK_SPECIFIC_PARAM_GRID = {
         # sed_eval is very slow
         "check_val_every_n_epoch": [10],
     },
-    "tau2018-ov1": {
-        "check_val_every_n_epoch": [25]
+    "tau2018_ov1": {
+        "check_val_every_n_epoch": [1]
     },
     "tau2018_ov2": {
         "check_val_every_n_epoch": [25],
@@ -85,7 +86,7 @@ PARAM_GRID = {
     # "lr": [1e-2, 3.2e-3, 1e-3, 3.2e-4, 1e-4],
     # "lr": [1e-1, 1e-2, 1e-3, 1e-4, 1e-5],
     "patience": [20],
-    "max_epochs": [500],
+    "max_epochs": [2],
     # "max_epochs": [500, 1000],
     "check_val_every_n_epoch": [3],
     # "check_val_every_n_epoch": [1, 3, 10],
@@ -539,19 +540,12 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 timestamp,
                 self.nlabels
             )
-            if self.cached:
-                ref_events = self._retrieve_from_cache(
-                    name
-                )
-            else:
-                ref_events = get_ref_accdoa_events(
-                    self.target_events[name],             
-                    self.target_timestamps[name],
-                    self.nlabels,
-                    label_to_idx=self.label_to_idx
-                )
-                self._cache(ref_events, name)
-                self.cached = True
+            ref_events = get_ref_accdoa_events(
+                  self.target_events[name],             
+                  self.target_timestamps[name],
+                  self.nlabels,
+                  label_to_idx=self.label_to_idx
+              )
             _nb_pred_frames_1s = int(1000 // diff)
             _nb_label_frames_1s = _nb_pred_frames_1s if self.source == "static" else self._nb_label_frames_1s
             self.log_scores(
@@ -573,7 +567,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
     def epoch_best_postprocessing_or_default(
         self, epoch: int
     ) -> Tuple[Tuple[str, Any], ...]:
-        return None
+        return []
 
 
 class EventPredictionModel(AbstractPredictionModel):
@@ -673,7 +667,7 @@ class EventPredictionModel(AbstractPredictionModel):
             )
 
             score_and_postprocessing = []
-            for postprocessing in tqdm(predicted_events_by_postprocessing):
+            for postprocessing in predicted_events_by_postprocessing:
                 print("post processing")
                 predicted_events = predicted_events_by_postprocessing[postprocessing]
                 primary_score_fn = self.scores[0]
@@ -769,7 +763,7 @@ class SplitMemmapDataset(Dataset):
         )
         if in_memory:
             self.embeddings = torch.stack(
-                [torch.tensor(e) for e in tqdm(self.embeddings)]
+                [torch.tensor(e) for e in self.embeddings]
             )
             nandim = self.embeddings.isnan().sum().tolist()
             infdim = self.embeddings.isinf().sum().tolist()
@@ -803,7 +797,7 @@ class SplitMemmapDataset(Dataset):
         Later we reduce this with an argmax to get the vocabulary indices.
         """
         ys = []
-        for idx in tqdm(range(len(self.labels))):
+        for idx in range(len(self.labels)):
             # If we indeed have self.label_to_idx!
             if (
                 ("cartesian" not in task)
@@ -1494,36 +1488,43 @@ def task_predictions_train(
         random_probe=random_probe,
     )
     trainer.fit(predictor, train_dataloader, valid_dataloader)
-    if checkpoint_callback.best_model_score is not None:
-        sys.stdout.flush()
-        end = time.time()
-        time_in_min = (end - start) / 60
-        epoch = torch.load(checkpoint_callback.best_model_path, weights_only = False)["epoch"]
-        print(f"Loaded epoch : {epoch}")
-        if metadata["embedding_type"] == "event":
-            best_postprocessing = predictor.epoch_best_postprocessing_or_default(epoch)
-        else:
-            best_postprocessing = []
-        # TODO: Postprocessing
-        logger.log_metrics({"time_in_min": time_in_min})
-        logger.finalize("success")
-        logger.save()
-        return GridPointResult(
-            predictor=predictor,
-            model_path=checkpoint_callback.best_model_path,
-            epoch=epoch,
-            time_in_min=time_in_min,
-            hparams=dict(predictor.hparams),
-            postprocessing=best_postprocessing,
-            trainer=trainer,
-            validation_score=checkpoint_callback.best_model_score.detach().cpu().item(),
-            score_mode=mode,
-            conf=conf,
-        )
-    else:
-        raise ValueError(
-            f"No score {checkpoint_callback.best_model_score} for this model"
-        )
+    try:
+      if checkpoint_callback.best_model_score is not None:
+          sys.stdout.flush()
+          end = time.time()
+          time_in_min = (end - start) / 60
+          epoch = torch.load(checkpoint_callback.best_model_path, weights_only = False)["epoch"]
+          print(f"Loaded epoch : {epoch}")
+          if metadata["embedding_type"] == "event":
+              best_postprocessing = predictor.epoch_best_postprocessing_or_default(epoch)
+          else:
+              best_postprocessing = []
+          # TODO: Postprocessing
+          logger.log_metrics({"time_in_min": time_in_min})
+          logger.finalize("success")
+          logger.save()
+          return GridPointResult(
+              predictor=predictor,
+              model_path=checkpoint_callback.best_model_path,
+              epoch=epoch,
+              time_in_min=time_in_min,
+              hparams=dict(predictor.hparams),
+              postprocessing=best_postprocessing,
+              trainer=trainer,
+              validation_score=checkpoint_callback.best_model_score.detach().cpu().item(),
+              score_mode=mode,
+              conf=conf,
+          )
+      else:
+          raise ValueError(
+              f"No score {checkpoint_callback.best_model_score} for this model"
+          )
+    except ValueError as e:
+      return e
+    finally:
+      del train_dataloader
+      del valid_dataloader
+      gc.collect()
 
 
 def task_predictions_test(
