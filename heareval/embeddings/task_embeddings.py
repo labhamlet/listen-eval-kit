@@ -247,6 +247,8 @@ def get_labels_for_timestamps(labels: List, timestamps: np.ndarray) -> List:
         for event in label:
             # We add 0.0001 so that the end also includes the event
             # Here we add the direction of the event if the interval tree actually contains it!
+            #If we have same events with different directions it assumed that it is already handeled
+            #Before we pass to this function.
             if "direction" in event:
                 tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["direction"]))
             else:
@@ -338,13 +340,9 @@ def memmap_embeddings(
                 assert isinstance(lbl, tuple)
                 assert isinstance(lbl[0], str)
                 assert isinstance(lbl[1], list)
-            #Do not confuse this with multi-ACCDOA approach. We are using the normal ACCDOA
-            #Even if we have multiple same instance overlapping segments.
-            elif metadata["prediction_type"] == "multi-event-accdoa":
-                assert isinstance(lbl, list)
             else:
                 NotImplementedError(
-                    "Only multiclass, multilabel, accdoa and multi-event-accdoa prediction types"
+                    "Only multiclass, multilabel and accdoa prediction types"
                     f"implemented for scene embeddings. Received {metadata['prediction_type']}"
                 )
 

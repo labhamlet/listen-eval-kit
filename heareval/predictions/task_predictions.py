@@ -127,7 +127,7 @@ FASTER_PARAM_GRID.update(
 
 # These are good for dcase, change for other event-based secret tasks
 EVENT_POSTPROCESSING_GRID = {
-    "median_filter_ms": [250, 500],
+    "median_filter_ms": [250],
     "min_duration": [250, 500],
     #    "median_filter_ms": [0, 62, 125, 250, 500, 1000],
     #    "min_duration": [0, 62, 125, 250, 500, 1000],
