@@ -672,15 +672,20 @@ class SELD(ScoreFunction):
     def __init__(
         self,
         label_to_idx: Dict[str, int],
+        nb_classes:int,
+        doa_threshold:float,
+        average:str,
         scores: Tuple[str],
-        params: Dict = None,
         name: Optional[str] = None,
         maximize: bool = True,
     ):
-        if params is None: params = {}
+        
         super().__init__(label_to_idx=label_to_idx, name=name, maximize=maximize)
         self.scores = scores
-        self.params = params
+        self.params = {}
+        self.nb_classes = nb_classes 
+        self.doa_threshold = doa_threshold
+        self.average=average
 
     def _compute(self,
         pred_dicts,
@@ -689,7 +694,7 @@ class SELD(ScoreFunction):
         
         overall_scores = {}
 
-        eval = SELDMetrics(nb_classes=self.params["nb_classes"], doa_threshold=self.params["doa_threshold"], average=self.params["average"])
+        eval = SELDMetrics(nb_classes=self.nb_classes, doa_threshold=self.doa_threshold, average=self.average)
         for file_name in pred_dicts.keys():
             pred_dict = pred_dicts[file_name]
             ref_dict = ref_dicts[file_name]
@@ -1058,7 +1063,6 @@ available_scores: Dict[str, Callable] = {
         SELD,
         name="SELD",
         scores=("SELD", "ER", "F", "LE", "LR"),
-        params= {"nb_classes": 8, "doa_threshold": 20, "average": "macro"},
         maximize=False,
     ),
     "mAP": MeanAveragePrecision,

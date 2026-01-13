@@ -1376,11 +1376,16 @@ def task_predictions_train(
         else:
             postprocessing_grid = EVENT_POSTPROCESSING_GRID
 
-
+        print("VALID: ", data_splits["valid"])
+        print("TEST: ", data_splits["test"])
         if metadata["prediction_type"] == "accdoa":
             if metadata["source_dynamics"] == "static":
-                _timestamps_test = load_timestamps(embedding_path, metadata, "test")
-                _timestamps_valid = load_timestamps(embedding_path, metadata, "valid")
+                _timestamps_test = {}
+                _timestamps_valid = {}
+                for split_name in data_splits["valid"]:
+                    _timestamps_valid.update(load_timestamps(embedding_path, metadata, split_name))
+                for split_name in data_splits["test"]:
+                    _timestamps_test.update(load_timestamps(embedding_path, metadata, split_name))
                 validation_target_events: Dict = map_to_frames(validation_target_events, _timestamps_valid)
                 test_target_events: Dict = map_to_frames(test_target_events, _timestamps_test)
             
@@ -1749,6 +1754,14 @@ def task_predictions(
     # wandb.init(project="heareval", tags=["predictions", embedding_path.name])
 
     label_to_idx = label_vocab_as_dict(label_vocab, key="label", value="idx")
+    scores = [] 
+    for score in metadata["evaluation"]:
+      if score == "SELD":
+        score_method = available_scores[score](label_to_idx=label_to_idx,
+        nb_classes = nlabels,
+        doa_threshold = metadata["evaluation_params"]["doa_threshold"],
+        average = metadata["evaluation_params"]["average"]
+        )
     scores = [
         available_scores[score](label_to_idx=label_to_idx)
         for score in metadata["evaluation"]

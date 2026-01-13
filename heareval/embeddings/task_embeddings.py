@@ -33,7 +33,7 @@ import torchaudio
 # Later publish it to pypi.
 import sys
 
-sys.path.append("../../GRAM-Clean")
+sys.path.append("../../GRAM-Ambisonics")
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -336,13 +336,9 @@ def memmap_embeddings(
                 assert len(lbl) == 1
             elif metadata["prediction_type"] == "multilabel":
                 assert isinstance(lbl, list)
-            elif metadata['prediction_type'] == "accdoa":
-                assert isinstance(lbl, tuple)
-                assert isinstance(lbl[0], str)
-                assert isinstance(lbl[1], list)
             else:
                 NotImplementedError(
-                    "Only multiclass, multilabel and accdoa prediction types"
+                    "Only multiclass, multilabel prediction types"
                     f"implemented for scene embeddings. Received {metadata['prediction_type']}"
                 )
 
