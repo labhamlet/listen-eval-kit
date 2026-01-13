@@ -33,7 +33,7 @@ import torchaudio
 # Later publish it to pypi.
 import sys
 
-sys.path.append("/home/gyuksel3/phd/GRAM-JEPA") #Append the root directory. In this case it is GRAM-T
+sys.path.append("../../GRAM-Clean")
 from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -246,12 +246,18 @@ def get_labels_for_timestamps(labels: List, timestamps: np.ndarray) -> List:
         # Add all events to the label tree
         for event in label:
             # We add 0.0001 so that the end also includes the event
-            tree.addi(event["start"], event["end"] + 0.0001, event["label"])
+            # Here we add the direction of the event if the interval tree actually contains it!
+            if "direction" in event:
+                tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["direction"]))
+            else:
+                tree.addi(event["start"], event["end"] + 0.0001, event["label"])
 
         labels_for_sound = []
         # Update the binary vector of labels with intervals for each timestamp
+        # interval labels now is not only only, but could also be Tuple of str and List[float]
+        # List of float corresponds to the direction labels of the events.
         for j, t in enumerate(timestamps[i]):
-            interval_labels: List[str] = [interval.data for interval in tree[t]]
+            interval_labels: List[str | Tuple[str, List[float]]] = [interval.data for interval in tree[t]]
             labels_for_sound.append(interval_labels)
             # If we want to store the timestamp too
             # labels_for_sound.append([float(t), interval_labels])
@@ -328,9 +334,17 @@ def memmap_embeddings(
                 assert len(lbl) == 1
             elif metadata["prediction_type"] == "multilabel":
                 assert isinstance(lbl, list)
+            elif metadata['prediction_type'] == "accdoa":
+                assert isinstance(lbl, tuple)
+                assert isinstance(lbl[0], str)
+                assert isinstance(lbl[1], list)
+            #Do not confuse this with multi-ACCDOA approach. We are using the normal ACCDOA
+            #Even if we have multiple same instance overlapping segments.
+            elif metadata["prediction_type"] == "multi-event-accdoa":
+                assert isinstance(lbl, list)
             else:
                 NotImplementedError(
-                    "Only multiclass and multilabel prediction types"
+                    "Only multiclass, multilabel, accdoa and multi-event-accdoa prediction types"
                     f"implemented for scene embeddings. Received {metadata['prediction_type']}"
                 )
 
