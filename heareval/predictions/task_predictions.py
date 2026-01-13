@@ -1757,15 +1757,16 @@ def task_predictions(
     scores = [] 
     for score in metadata["evaluation"]:
       if score == "SELD":
-        score_method = available_scores[score](label_to_idx=label_to_idx,
-        nb_classes = nlabels,
-        doa_threshold = metadata["evaluation_params"]["doa_threshold"],
-        average = metadata["evaluation_params"]["average"]
+        score_method = available_scores[score](
+          label_to_idx=label_to_idx,
+          nb_classes = nlabels,
+          doa_threshold = metadata["evaluation_params"]["doa_threshold"],
+          average = metadata["evaluation_params"]["average"]
         )
-    scores = [
-        available_scores[score](label_to_idx=label_to_idx)
-        for score in metadata["evaluation"]
-    ]
+      else:
+        score_method = available_scores[score](label_to_idx=label_to_idx)
+      scores.append(score_method)
+
 
     use_scoring_for_early_stopping = metadata.get(
         "use_scoring_for_early_stopping", True
