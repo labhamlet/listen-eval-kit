@@ -134,6 +134,17 @@ EVENT_POSTPROCESSING_GRID = {
 
 NUM_WORKERS = int(multiprocessing.cpu_count() / (max(1, torch.cuda.device_count())))
 
+
+def convert_from_spherical_to_cart(az, el):
+    ele_rad = el*np.pi/180.
+    azi_rad = az*np.pi/180
+
+    tmp_label = np.cos(ele_rad)
+    x = np.cos(azi_rad) * tmp_label
+    y = np.sin(azi_rad) * tmp_label
+    z = np.sin(ele_rad)
+    return x.item(),y.item(),z.item()
+
 class SetEpochCallback(pl.Callback):
     def __init__(self, epoch):
         self.epoch = epoch
@@ -821,7 +832,8 @@ class SplitMemmapDataset(Dataset):
                 for class_str, doa_tuple in zip(active_classes, active_doas):
                     # Convert string label to integer index
                     class_idx = self.label_to_idx[str(class_str)]
-                    y[class_idx] = torch.tensor(doa_tuple).float()
+                    x, y, z = convert_from_spherical_to_cart(doa_tuple[0], doa_tuple[1])
+                    y[class_idx] = torch.tensor([x,y,z]).float()
             else:
                 y = torch.tensor(self.labels[idx])
             ys.append(y)
@@ -872,12 +884,16 @@ def get_ref_accdoa_events(
             for event in events:
               class_str = event[0]
               doa_tuple = event[1]   
+              assert len(doa_tuple) == 2, f"DOA Tuple is not polar : {doa_tuple}"
               class_idx = label_to_idx[str(class_str)]
               if filename not in event_dict:
                 event_dict[filename] = {}
               if timestamp_idx not in event_dict[filename]:
                 event_dict[filename][timestamp_idx] = []
-              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1]), float(doa_tuple[2]), 0])
+              #class_id, source_id,
+              #Wait, we actually do not have a source here for overlapping events more than two.
+              #TODO check this.
+              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
 
     return event_dict
 

@@ -693,9 +693,9 @@ class SELD(ScoreFunction):
         for file_name in pred_dicts.keys():
             pred_dict = pred_dicts[file_name]
             ref_dict = ref_dicts[file_name]
-            #Our dictionaries are all in cartesian format, and SELD metric expect polar.
+            #Our prediction dict is in cartesian format, so convert it to polar!
             pred_dict = convert_output_format_cartesian_to_polar(pred_dict)
-            ref_dict = convert_output_format_cartesian_to_polar(ref_dict)
+            #ref_dict is already in polar format!
             nb_ref_frames = max(list(ref_dict.keys()))
             pred_labels = segment_labels(pred_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
             ref_labels = segment_labels(ref_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
