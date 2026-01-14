@@ -232,7 +232,7 @@ def save_timestamp_embedding_and_labels(
         json.dump(labels[i], open(f"{out_file}.target-labels.json", "w"), indent=4)
 
 
-def get_labels_for_timestamps(labels: List, timestamps: np.ndarray) -> List:
+def get_labels_for_timestamps(labels: List, timestamps: np.ndarray, source: Optional[str]) -> List:
     # -> List[List[List[str]]]:
     # -> List[List[str]]:
     # TODO: Is this function redundant?
@@ -249,10 +249,21 @@ def get_labels_for_timestamps(labels: List, timestamps: np.ndarray) -> List:
             # Here we add the direction of the event if the interval tree actually contains it!
             #If we have same events with different directions it assumed that it is already handeled
             #Before we pass to this function.
+            
             if "direction" in event:
+                assert source is not None, "Got source None, please pass source_dyamics: (dynamic, static) in metadata"
+            if "direction" in event and source == "static":
                 tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["direction"]))
-            else:
+            elif "direction" in event and source == "dynamic":
+                assert "source_idx" in event, "Events do not contain a source idx"
+                #For [0,100), [100, 200) ... we are substracting a very small amount from the end label
+                #so that the dynamic direction information can still be preserved and not overlapped
+                #TODO! Change this line once we add Multi-ACCDOA training, for now do not support it.
+                tree.addi(event["start"], event["end"] - 0.0001, (event["label"], event["direction"]))
+            elif "direction" not in event and source is None:
                 tree.addi(event["start"], event["end"] + 0.0001, event["label"])
+            else:
+                raise ValueError("Got direction and source not matching")
 
         labels_for_sound = []
         # Update the binary vector of labels with intervals for each timestamp
@@ -260,6 +271,9 @@ def get_labels_for_timestamps(labels: List, timestamps: np.ndarray) -> List:
         # List of float corresponds to the direction labels of the events.
         for j, t in enumerate(timestamps[i]):
             interval_labels: List[str | Tuple[str, List[float]]] = [interval.data for interval in tree[t]]
+            #When we have a dynamic source, we select only one event of the same class!
+            #Or not, because this will actually mess-up with the evaluation code.
+            #We do have a hungarian algorithm that will solve the assignment issue in the eval code!
             labels_for_sound.append(interval_labels)
             # If we want to store the timestamp too
             # labels_for_sound.append([float(t), interval_labels])
@@ -453,11 +467,11 @@ def task_embeddings(
                 embeddings, timestamps = embedding.get_timestamp_embedding_as_numpy(
                     audios
                 )
-                labels = get_labels_for_timestamps(labels, timestamps)
+                labels = get_labels_for_timestamps(labels, timestamps, metadata.get("source_dynamics", None))
                 assert len(labels) == len(filenames)
                 assert len(labels[0]) == len(timestamps[0])
                 save_timestamp_embedding_and_labels(
-                    embeddings, timestamps, labels, filenames, outdir
+                    embeddings, timestamps, labels, filenames, outdir,
                 )
             else:
                 raise ValueError(

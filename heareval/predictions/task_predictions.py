@@ -474,7 +474,8 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         test_target_timestamps: Dict[str, List[float]],
         conf: Dict,
         use_scoring_for_early_stopping: bool = True,
-        source : str = 'static'
+        source : str = 'static',
+        _nb_label_frames_1s: Optional[int] = 10
     ):
         super().__init__(
             nfeatures=nfeatures,
@@ -486,8 +487,6 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             use_scoring_for_early_stopping=use_scoring_for_early_stopping,
             source = source
         )
-        #STARSS23 has 100ms
-        self.ref_timestamp_per_second = 10
         self.target_events = {
             "val": validation_target_events,
             "test": test_target_events,
@@ -500,6 +499,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         self.source = source
         self.cache = {}
         self.cached = False
+        self._nb_label_frames_1s = _nb_label_frames_1s
 
     def _cache(self, events, name):
         self.cache[name] = events
@@ -1379,16 +1379,15 @@ def task_predictions_train(
         print("VALID: ", data_splits["valid"])
         print("TEST: ", data_splits["test"])
         if metadata["prediction_type"] == "accdoa":
-            if metadata["source_dynamics"] == "static":
-                _timestamps_test = {}
-                _timestamps_valid = {}
-                for split_name in data_splits["valid"]:
-                    _timestamps_valid.update(load_timestamps(embedding_path, metadata, split_name))
-                for split_name in data_splits["test"]:
-                    _timestamps_test.update(load_timestamps(embedding_path, metadata, split_name))
-                validation_target_events: Dict = map_to_frames(validation_target_events, _timestamps_valid)
-                test_target_events: Dict = map_to_frames(test_target_events, _timestamps_test)
-            
+            _timestamps_test = {}
+            _timestamps_valid = {}
+            for split_name in data_splits["valid"]:
+                _timestamps_valid.update(load_timestamps(embedding_path, metadata, split_name))
+            for split_name in data_splits["test"]:
+                _timestamps_test.update(load_timestamps(embedding_path, metadata, split_name))
+            validation_target_events: Dict = map_to_frames(validation_target_events, _timestamps_valid)
+            test_target_events: Dict = map_to_frames(test_target_events, _timestamps_test)
+        
             predictor = ACCDOAPredictionModel(
                 nfeatures=embedding_size,
                 label_to_idx=label_to_idx,
@@ -1402,6 +1401,7 @@ def task_predictions_train(
                 conf=conf,
                 use_scoring_for_early_stopping=use_scoring_for_early_stopping,
                 source = metadata["source_dynamics"],
+                _nb_label_frames_1s = metadata.get("_nb_label_frames_1s", None)
             )
         else:
             predictor = EventPredictionModel(
