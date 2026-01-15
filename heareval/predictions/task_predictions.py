@@ -540,7 +540,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 timestamp,
                 self.nlabels
             )
-            ref_events = get_ref_accdoa_events(
+            ref_events, max_timestamps = get_ref_accdoa_events(
                   self.target_events[name],             
                   self.target_timestamps[name],
                   self.nlabels,
@@ -551,7 +551,8 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
             self.log_scores(
                 name, score_args=(pred_events,
                     ref_events,
-                    _nb_label_frames_1s
+                    _nb_label_frames_1s,
+                    max_timestamps
                     )
             )
             if name == "test":
@@ -867,12 +868,17 @@ def get_ref_accdoa_events(
         str, Dict[int, List[List[int | float]]]
     ] = {}
 
+    max_timestamps = float("-inf")
     for filename in ref_timestamps:
         filename = os.path.basename(filename)
         # Loads from the test/valid folds.
-        # Get the timestamp for the ref_timestamps, and map it into ACCDOA style?
         assert sorted(ref_timestamps[filename]) == ref_timestamps[filename], f"Timestamps for {filename} is not sorted!"
-        for timestamp_idx, timestamp in enumerate(ref_timestamps[filename]):
+        
+        if len(ref_timestamps[filename]) > max_timestamps:
+            max_timestamps = len(ref_timestamps[filename])
+
+        #Here just get the frame_idx from the timestamp information
+        for timestamp_idx in range(ref_timestamps[filename]):
           events = references[filename][timestamp_idx]
           if len(events) != 0: #If there is an active event
             for event in events:
@@ -889,7 +895,7 @@ def get_ref_accdoa_events(
               #TODO check this.
               event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
 
-    return event_dict
+    return event_dict, max_timestamps
 
 def get_accdoa_events(
     predictions: torch.Tensor,
@@ -1759,10 +1765,17 @@ def task_predictions(
       if score == "SELD":
         score_method = available_scores[score](
           label_to_idx=label_to_idx,
-          nb_classes = nlabels,
           doa_threshold = metadata["evaluation_params"]["doa_threshold"],
           average = metadata["evaluation_params"]["average"]
         )
+      elif score == "OldSELD":
+        score_method = available_scores[score](
+          label_to_idx=label_to_idx,
+          nb_classes = nlabels,
+          azimuth_list : metadata["evaluation_params"]["azimuth_limits"], 
+          elevation_list : metadata["evaluation_params"]["elevation_limits"],
+          _doa_resolution: metadata["evaluation_params"]["doa_resolution"] 
+        )        
       else:
         score_method = available_scores[score](label_to_idx=label_to_idx)
       scores.append(score_method)
