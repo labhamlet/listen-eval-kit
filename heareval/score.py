@@ -44,10 +44,24 @@ def convert_output_format_new_to_old(in_dict):
             out_dict[frame_cnt] = []
             for tmp_val in in_dict[frame_cnt]:
                 az, el = tmp_val[2], tmp_val[3]
-                r = np.sqrt(x**2 + y**2 + z**2)
-                out_dict[frame_cnt].append([tmp_val[0], azimuth, elevation])
+                out_dict[frame_cnt].append([tmp_val[0], az, el])
     return out_dict
 
+def compute_seld_metric(sed_error, doa_error):
+    """
+    Compute SELD metric from sed and doa errors.
+
+    :param sed_error: [error rate (0 to 1 range), f score (0 to 1 range)]
+    :param doa_error: [doa error (in degrees), frame recall (0 to 1 range)]
+    :return: seld metric result
+    """
+    seld_metric = np.mean([
+        sed_error[0],
+        1 - sed_error[1],
+        doa_error[0]/180,
+        1 - doa_error[1]]
+        )
+    return seld_metric
 
 class SELDMetrics(object):
     def __init__(self, doa_threshold=20, nb_classes=11, average='macro'):
@@ -257,6 +271,7 @@ class OldSELDMetrics(object):
         self._less_est_cnt, self._less_est_frame_cnt = 0, 0
         self._more_est_cnt, self._more_est_frame_cnt = 0, 0
         self._data_gen = data_gen
+
 
     def f1_overall_framewise(self, O, T):
         TP = ((2 * T - O) == 1).sum()
@@ -869,12 +884,11 @@ class OldSELD(ScoreFunction):
         self,
         label_to_idx: Dict[str, int],
         scores: Tuple[str],
-        name: Optional[str] = None,
-        maximize: bool = True,
         azimuth_list : Tuple[int, int], 
         elevation_list : Tuple[int, int],
         _doa_resolution: int, 
-
+        name: Optional[str] = None,
+        maximize: bool = True
     ):
         
         super().__init__(label_to_idx=label_to_idx, name=name, maximize=maximize)
@@ -903,17 +917,17 @@ class OldSELD(ScoreFunction):
             ref_dict = convert_output_format_new_to_old(ref_dict)
 
             #Convert from regression to classification for DOA, the max_frames is indeed the same as prediction labels.
-            gt_labels = self.output_format_dict_to_classification_labels(ref_dict, max_frames)
-            pred_labels = self.output_format_dict_to_classification_labels(pred_dict, max_frames)
+            gt_labels = self.output_format_dict_to_classification_labels(ref_dict, _max_frames)
+            pred_labels = self.output_format_dict_to_classification_labels(pred_dict, _max_frames)
             # Calculated SED and DOA scores
 
             eval.update_sed_scores(pred_labels.max(2), gt_labels.max(2))
             eval.update_doa_scores(pred_labels, gt_labels)
 
         # Overall SED and DOA scores
-        ER, D = eval.compute_sed_scores()
+        ER, F = eval.compute_sed_scores()
         LE, LR = eval.compute_doa_scores()
-        seld_scr = evaluation_metrics.compute_seld_metric([er, f], [doa_err, frame_recall])
+        seld_scr = compute_seld_metric([ER, F], [LE, LR])
 
         overall_scores["ER"] = ER
         overall_scores["F"] = F 
@@ -927,15 +941,15 @@ class OldSELD(ScoreFunction):
     def output_format_dict_to_classification_labels(self, _output_dict, max_frames):
 
         _nb_classes = len(self.label_to_idx)
-        _labels = np.zeros((_max_frames, _nb_classes, len(self._azi_list) * len(self._ele_list)))
+        _labels = np.zeros((max_frames, _nb_classes, len(self._azi_list) * len(self._ele_list)))
 
         for _frame_cnt in _output_dict.keys():
             for _tmp_doa in _output_dict[_frame_cnt]:
                 # Making sure the doa's are within the limits
-                _tmp_doa[1] = np.clip(_tmp_doa[1], _azi_list[0], _azi_list[-1])
-                _tmp_doa[2] = np.clip(_tmp_doa[2], _ele_list[0], _ele_list[-1])
+                _tmp_doa[1] = np.clip(_tmp_doa[1], self._azi_list[0], self._azi_list[-1])
+                _tmp_doa[2] = np.clip(_tmp_doa[2], self._ele_list[0], self._ele_list[-1])
                 # create label
-                _labels[_frame_cnt, _tmp_doa[0], int(OldSELD.get_list_index(_tmp_doa[1], _tmp_doa[2]))] = 1
+                _labels[_frame_cnt, _tmp_doa[0], int(self.get_list_index(_tmp_doa[1], _tmp_doa[2]))] = 1
 
         return _labels
      

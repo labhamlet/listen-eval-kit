@@ -878,7 +878,7 @@ def get_ref_accdoa_events(
             max_timestamps = len(ref_timestamps[filename])
 
         #Here just get the frame_idx from the timestamp information
-        for timestamp_idx in range(ref_timestamps[filename]):
+        for timestamp_idx in range(len(ref_timestamps[filename])):
           events = references[filename][timestamp_idx]
           if len(events) != 0: #If there is an active event
             for event in events:
@@ -1771,10 +1771,9 @@ def task_predictions(
       elif score == "OldSELD":
         score_method = available_scores[score](
           label_to_idx=label_to_idx,
-          nb_classes = nlabels,
-          azimuth_list : metadata["evaluation_params"]["azimuth_limits"], 
-          elevation_list : metadata["evaluation_params"]["elevation_limits"],
-          _doa_resolution: metadata["evaluation_params"]["doa_resolution"] 
+          azimuth_list = metadata["evaluation_params"]["azimuth_limits"], 
+          elevation_list = metadata["evaluation_params"]["elevation_limits"],
+          _doa_resolution = metadata["evaluation_params"]["doa_resolution"] 
         )        
       else:
         score_method = available_scores[score](label_to_idx=label_to_idx)
