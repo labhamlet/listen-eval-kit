@@ -37,13 +37,15 @@ def convert_output_format_cartesian_to_polar(in_dict):
                 out_dict[frame_cnt].append([tmp_val[0], tmp_val[1], azimuth, elevation])
     return out_dict
 
-def convert_output_format_new_to_old(in_dict):
+#Got the elevtion scaling from https://github.com/sharathadavanne/seld-dcase2019/blob/master/seld.py#L153
+def convert_output_format_new_to_old(in_dict, elevation_scaling):
     out_dict = {}
     for frame_cnt in in_dict.keys():
         if frame_cnt not in out_dict:
             out_dict[frame_cnt] = []
             for tmp_val in in_dict[frame_cnt]:
                 az, el = tmp_val[2], tmp_val[3]
+                el = el / elevation_scaling
                 out_dict[frame_cnt].append([tmp_val[0], az, el])
     return out_dict
 
@@ -897,6 +899,8 @@ class OldSELD(ScoreFunction):
         self._azi_list = range(azimuth_list[0], azimuth_list[1], _doa_resolution)
         self._ele_list = range(elevation_list[0], elevation_list[1], _doa_resolution)
         self._height = len(self._ele_list)
+        self.default_ele = elevation_list[1] 
+        self.elevation_scaling = 180./self.default_ele
 
     def _compute(self,
         pred_dicts,
@@ -913,8 +917,8 @@ class OldSELD(ScoreFunction):
 
             #Our prediction dict is in cartesian format, so convert it to polar!
             pred_dict = convert_output_format_cartesian_to_polar(pred_dict)
-            pred_dict = convert_output_format_new_to_old(pred_dict)
-            ref_dict = convert_output_format_new_to_old(ref_dict)
+            pred_dict = convert_output_format_new_to_old(pred_dict, self.elevation_scaling)
+            ref_dict = convert_output_format_new_to_old(ref_dict, self.elevation_scaling)
 
             #Convert from regression to classification for DOA, the max_frames is indeed the same as prediction labels.
             gt_labels = self.output_format_dict_to_classification_labels(ref_dict, _max_frames)
