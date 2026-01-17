@@ -62,6 +62,12 @@ TASK_SPECIFIC_PARAM_GRID = {
     "tau2018_ov2": {
         "check_val_every_n_epoch": [25],
     },
+    "tau2018_ov2_split1": {
+        "check_val_every_n_epoch": [50],
+        "hidden_layers": [1],
+        "lr": [1e-4],
+        "initialization" : [torch.nn.init.xavier_normal_]
+    },
     "tau2018-ov3": {
         "check_val_every_n_epoch": [25]
     }
@@ -1765,15 +1771,15 @@ def task_predictions(
       if score == "SELD":
         score_method = available_scores[score](
           label_to_idx=label_to_idx,
-          doa_threshold = metadata["evaluation_params"]["doa_threshold"],
-          average = metadata["evaluation_params"]["average"]
+          doa_threshold = metadata["scoring_params"]["doa_threshold"],
+          average = metadata["scoring_params"]["average"]
         )
       elif score == "OldSELD":
         score_method = available_scores[score](
           label_to_idx=label_to_idx,
-          azimuth_list = metadata["evaluation_params"]["azimuth_limits"], 
-          elevation_list = metadata["evaluation_params"]["elevation_limits"],
-          _doa_resolution = metadata["evaluation_params"]["doa_resolution"] 
+          azimuth_list = metadata["scoring_params"]["azimuth_limits"], 
+          elevation_list = metadata["scoring_params"]["elevation_limits"],
+          _doa_resolution = metadata["scoring_params"]["doa_resolution"] 
         )        
       else:
         score_method = available_scores[score](label_to_idx=label_to_idx)
@@ -1815,7 +1821,8 @@ def task_predictions(
     # Model selection
     confs = list(ParameterGrid(final_grid))
     random.shuffle(confs)
-
+    #Bug fix: Grid point shows more than available combinations
+    grid_points = min(len(confs), grid_points)
     grid_point_results = []
     for confi, conf in tqdm(enumerate(confs[:grid_points]), desc="grid"):
         logger.info(f"Grid point {confi + 1} of {grid_points}: {conf}")
