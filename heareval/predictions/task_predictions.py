@@ -1693,7 +1693,11 @@ def get_splits_from_metadata(metadata: Dict) -> List[Dict[str, List[str]]]:
         # splits to test over. This expects that k data folds were generated
         # during pre-processing and the names of each of these folds is listed
         # in the metadata["folds"] variable.
-        data_splits = data_splits_from_folds(folds)
+        fold_spec = metadata.get("fold_specification", None)
+        if fold_spec is not None:
+            data_splits = fold_spec
+        else:
+            data_splits = data_splits_from_folds(folds)
     else:
         raise AssertionError(
             f"Unknown split_mode: {metadata['split_mode']} in task metadata."
