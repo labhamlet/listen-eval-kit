@@ -56,21 +56,34 @@ TASK_SPECIFIC_PARAM_GRID = {
         # sed_eval is very slow
         "check_val_every_n_epoch": [10],
     },
-    "tau2018_ov1": {
-        "check_val_every_n_epoch": [25]
-    },
-    "tau2018_ov2": {
-        "check_val_every_n_epoch": [25],
-    },
-    "tau2018_ov2_split1": {
+    "tau2018_ov3_split1": {
         "check_val_every_n_epoch": [50],
-        "hidden_layers": [1],
-        "lr": [1e-4],
-        "initialization" : [torch.nn.init.xavier_normal_]
+        "patience": [3],
+    },    
+    "tau2018_ov3_split8": {
+        "check_val_every_n_epoch": [50],
+        "patience": [3],
+    },    
+    "tau2018_ov3_split9": {
+        "check_val_every_n_epoch": [50],
+        "patience": [3],
     },
-    "tau2018-ov3": {
-        "check_val_every_n_epoch": [25]
-    }
+    "tau2019": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },
+    "tau2020": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },
+    "tau2021": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },
+    "starss2023": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },
 }
 
 PARAM_GRID = {
