@@ -1302,7 +1302,7 @@ class GridPointResult:
 
 
 
-def map_to_frames(target_events: Dict[str, List[Dict[str, Any]]], timestamps: Dict[str, List[float]]):
+def map_to_frames(target_events: Dict[str, List[Dict[str, Any]]], timestamps: Dict[str, List[float]], metadata):
     #Maps to frames:
     # {'c0e28dc8.wav': [{'label': 'jack_hammer', 'direction': [-0.5751132772097123, -0.33771451916904743, 0.7451131604793488], 'start': 345.88007775, 'end': 4345.88007775}
     # A list of labels present at each timestamp
@@ -1312,8 +1312,12 @@ def map_to_frames(target_events: Dict[str, List[Dict[str, Any]]], timestamps: Di
         events = target_events[file_name]
         tree = IntervalTree()
         for event in events:
-            tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["direction"]))
-        
+            if metadata["source_dynamics"] == "static":
+                tree.addi(event["start"], event["end"] + 0.001, (event["label"], event["direction"]))
+            elif metadata["source_dynamics"] == "dynamic":
+                tree.addi(event["start"], event["end"] - 0.001, (event["label"], event["direction"]))
+            else:
+                raise ValueError("source dyamics must be static or dynamic")
         labels_for_sound = []
         for time_stamp in timestamps[file_name]:
             interval_labels: List[str | Tuple[str, List[float]]] = [interval.data for interval in tree[time_stamp]]
@@ -1410,8 +1414,8 @@ def task_predictions_train(
                 _timestamps_valid.update(load_timestamps(embedding_path, metadata, split_name))
             for split_name in data_splits["test"]:
                 _timestamps_test.update(load_timestamps(embedding_path, metadata, split_name))
-            validation_target_events: Dict = map_to_frames(validation_target_events, _timestamps_valid)
-            test_target_events: Dict = map_to_frames(test_target_events, _timestamps_test)
+            validation_target_events: Dict = map_to_frames(validation_target_events, _timestamps_valid, metadata)
+            test_target_events: Dict = map_to_frames(test_target_events, _timestamps_test, metadata)
         
             predictor = ACCDOAPredictionModel(
                 nfeatures=embedding_size,
