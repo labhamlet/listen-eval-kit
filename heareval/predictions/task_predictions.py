@@ -891,6 +891,8 @@ def get_ref_accdoa_events(
 
     for filename in ref_timestamps:
         filename = os.path.basename(filename)
+        if filename not in event_dict:
+            event_dict[filename] = {}
         # Loads from the test/valid folds.
         assert sorted(ref_timestamps[filename]) == ref_timestamps[filename], f"Timestamps for {filename} is not sorted!"
         
@@ -903,8 +905,7 @@ def get_ref_accdoa_events(
               doa_tuple = event[1]   
               assert len(doa_tuple) == 2, f"DOA Tuple is not polar : {doa_tuple}"
               class_idx = label_to_idx[str(class_str)]
-              if filename not in event_dict:
-                event_dict[filename] = {}
+
               if frame_ind not in event_dict[filename]:
                 event_dict[filename][frame_ind] = []
             
@@ -990,15 +991,15 @@ def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
     accdoa_vectors = np.stack(predictions_list)
     predictions = {} 
     for time_frame in range(len(accdoa_vectors)):
-        timestamp_prediction = accdoa_vectors[time_frame] 
-        sed_magnitudes = np.linalg.norm(timestamp_prediction, axis=1)
+        current_frame = accdoa_vectors[time_frame] 
+        sed_magnitudes = np.linalg.norm(current_frame, axis=1)
         # Find indices where magnitude > 0.5 
         active_classes = np.where(sed_magnitudes > 0.5)[0]
         if len(active_classes) > 0:
-            predictions[frame_idx] = []
+            predictions[time_frame] = []
             for class_idx in active_classes:
                 x, y, z = current_frame[class_idx]
-                predictions[frame_idx].append([
+                predictions[time_frame].append([
                     int(class_idx), 
                     0, 
                     float(x), 
