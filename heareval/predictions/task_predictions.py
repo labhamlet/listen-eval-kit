@@ -553,7 +553,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         if name == "test" or self.use_scoring_for_early_stopping:
             #Here we get events for all files per filename.
             #TODO finish mapping this!
-            pred_events, diff, max_frames = get_accdoa_events(
+            pred_events, diff, _max_frames = get_accdoa_events(
                 prediction,
                 filename,
                 timestamp,
