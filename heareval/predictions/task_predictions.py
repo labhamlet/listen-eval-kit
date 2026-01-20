@@ -905,7 +905,7 @@ def get_ref_accdoa_events(
               class_idx = label_to_idx[str(class_str)]
               if filename not in event_dict:
                 event_dict[filename] = {}
-              if timestamp_idx not in event_dict[filename]:
+              if frame_ind not in event_dict[filename]:
                 event_dict[filename][frame_ind] = []
             
               event_dict[filename][frame_ind].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
@@ -960,7 +960,8 @@ def get_accdoa_events(
 
     max_frames = max(len(event_files[slug]) for slug in event_files)
     #This event dict has to contain file_names as key and the values should be frame_ind : [[detected_class_idx_1, 0, x, y, z, 0], [detected_class_idx_2, 0, x, y, z, 0]]
-    #First key is the filename, and the second key in the dict is the frame_idx.    
+    #First key is the filename, and the second key in the dict is the frame_idx.   \
+    #contains only the detected classes. 
     event_dict: Dict[
         str, Dict[int, List[List[int | float]]]
     ] = {}
