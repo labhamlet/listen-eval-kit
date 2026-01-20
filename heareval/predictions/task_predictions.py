@@ -991,17 +991,21 @@ def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
     predictions = {} 
     for time_frame in range(len(accdoa_vectors)):
         timestamp_prediction = accdoa_vectors[time_frame] 
-        x = timestamp_prediction[:, 0]
-        y = timestamp_prediction[:, 1]
-        z = timestamp_prediction[:, 2]
-        sed_magnitude = np.sqrt(x**2 + y**2 + z**2)
-        sed = np.where(sed_magnitude > 0.5)[0]
-        #For each predicted class, append the class index and float to the predictions
-        for class_idx in sed:
-            if time_frame not in predictions: 
-                predictions[time_frame] = [] 
-            predictions[time_frame].append([int(class_idx), 0, float(x[class_idx]), float(y[class_idx]), float(z[class_idx]), 0])
-
+        sed_magnitudes = np.linalg.norm(timestamp_prediction, axis=1)
+        # Find indices where magnitude > 0.5 
+        active_classes = np.where(sed_magnitudes > 0.5)[0]
+        if len(active_classes) > 0:
+            predictions[frame_idx] = []
+            for class_idx in active_classes:
+                x, y, z = current_frame[class_idx]
+                predictions[frame_idx].append([
+                    int(class_idx), 
+                    0, 
+                    float(x), 
+                    float(y), 
+                    float(z), 
+                    0
+                ])
     return predictions, np.mean(np.diff(np.array(timestamps)))
 
 
