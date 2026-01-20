@@ -895,8 +895,8 @@ def get_ref_accdoa_events(
         assert sorted(ref_timestamps[filename]) == ref_timestamps[filename], f"Timestamps for {filename} is not sorted!"
         
         #Here just get the frame_idx from the timestamp information
-        for timestamp_idx in range(len(ref_timestamps[filename])):
-          events = references[filename][timestamp_idx]
+        for frame_ind in range(len(ref_timestamps[filename])):
+          events = references[filename][frame_ind]
           if len(events) != 0: #If there is an active event
             for event in events:
               class_str = event[0]
@@ -906,11 +906,9 @@ def get_ref_accdoa_events(
               if filename not in event_dict:
                 event_dict[filename] = {}
               if timestamp_idx not in event_dict[filename]:
-                event_dict[filename][timestamp_idx] = []
-              #class_id, source_id,
-              #Wait, we actually do not have a source here for overlapping events more than two.
-              #TODO check this.
-              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
+                event_dict[filename][frame_ind] = []
+            
+              event_dict[filename][frame_ind].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
 
     return event_dict
 
@@ -997,10 +995,10 @@ def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
         z = timestamp_prediction[:, 2]
         sed_magnitude = np.sqrt(x**2 + y**2 + z**2)
         sed = np.where(sed_magnitude > 0.5)[0]
-        if time_frame not in predictions: 
-            predictions[time_frame] = [] 
         #For each predicted class, append the class index and float to the predictions
         for class_idx in sed:
+            if time_frame not in predictions: 
+                predictions[time_frame] = [] 
             predictions[time_frame].append([int(class_idx), 0, float(x[class_idx]), float(y[class_idx]), float(z[class_idx]), 0])
 
     return predictions, np.mean(np.diff(np.array(timestamps)))
