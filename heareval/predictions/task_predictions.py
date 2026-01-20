@@ -77,17 +77,17 @@ TASK_SPECIFIC_PARAM_GRID = {
         "patience": [3],
     },
     "tau2021": {
-        "check_val_every_n_epoch": [25],
-        "patience": [3],
+        "check_val_every_n_epoch": [3],
+        "patience": [10],
     },
-    "starss2023": {
-        "check_val_every_n_epoch": [25],
-        "patience": [3],
+    "starss23": {
+        "check_val_every_n_epoch": [10],
+        "patience": [10],
     },
 }
 
 PARAM_GRID = {
-    "hidden_layers": [1, 2],
+    "hidden_layers": [3],
     # "hidden_layers": [0, 1, 2],
     # "hidden_layers": [1, 2, 3],
     "hidden_dim": [1024],
@@ -100,12 +100,12 @@ PARAM_GRID = {
     # "dropout": [0.1, 0.3, 0.5],
     # "dropout": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
     # "dropout": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-    "lr": [3.2e-3, 1e-3, 3.2e-4, 1e-4],
+    "lr": [1e-4],
     # "lr": [3.2e-3, 1e-3, 3.2e-4, 1e-4, 3.2e-5, 1e-5],
     # "lr": [1e-2, 3.2e-3, 1e-3, 3.2e-4, 1e-4],
     # "lr": [1e-1, 1e-2, 1e-3, 1e-4, 1e-5],
     "patience": [20],
-    "max_epochs": [500],
+    "max_epochs": [1000],
     # "max_epochs": [500, 1000],
     "check_val_every_n_epoch": [3],
     # "check_val_every_n_epoch": [1, 3, 10],
@@ -120,7 +120,7 @@ PARAM_GRID = {
     "embedding_norm": [torch.nn.Identity],
     # "embedding_norm": [torch.nn.Identity, torch.nn.BatchNorm1d],
     # "embedding_norm": [torch.nn.Identity, torch.nn.BatchNorm1d, torch.nn.LayerNorm],
-    "initialization": [torch.nn.init.xavier_uniform_, torch.nn.init.xavier_normal_],
+    "initialization": [torch.nn.init.xavier_normal_],
     "optim": [torch.optim.Adam],
     # "optim": [torch.optim.Adam, torch.optim.SGD],
 }
@@ -553,25 +553,27 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         if name == "test" or self.use_scoring_for_early_stopping:
             #Here we get events for all files per filename.
             #TODO finish mapping this!
-            pred_events, diff = get_accdoa_events(
+            pred_events, diff, max_frames = get_accdoa_events(
                 prediction,
                 filename,
                 timestamp,
                 self.nlabels
             )
-            ref_events, max_timestamps = get_ref_accdoa_events(
+            ref_events = get_ref_accdoa_events(
                   self.target_events[name],             
                   self.target_timestamps[name],
                   self.nlabels,
                   label_to_idx=self.label_to_idx
               )
             _nb_pred_frames_1s = int(1000 // diff)
+            #Get the number of label frames and pred frames per second.
             _nb_label_frames_1s = _nb_pred_frames_1s if self.source == "static" else self._nb_label_frames_1s
             self.log_scores(
                 name, score_args=(pred_events,
                     ref_events,
                     _nb_label_frames_1s,
-                    max_timestamps
+                    _nb_pred_frames_1s,
+                    _max_frames
                     )
             )
             if name == "test":
@@ -887,15 +889,11 @@ def get_ref_accdoa_events(
         str, Dict[int, List[List[int | float]]]
     ] = {}
 
-    max_timestamps = float("-inf")
     for filename in ref_timestamps:
         filename = os.path.basename(filename)
         # Loads from the test/valid folds.
         assert sorted(ref_timestamps[filename]) == ref_timestamps[filename], f"Timestamps for {filename} is not sorted!"
         
-        if len(ref_timestamps[filename]) > max_timestamps:
-            max_timestamps = len(ref_timestamps[filename])
-
         #Here just get the frame_idx from the timestamp information
         for timestamp_idx in range(len(ref_timestamps[filename])):
           events = references[filename][timestamp_idx]
@@ -914,7 +912,7 @@ def get_ref_accdoa_events(
               #TODO check this.
               event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
 
-    return event_dict, max_timestamps
+    return event_dict
 
 def get_accdoa_events(
     predictions: torch.Tensor,
@@ -962,6 +960,7 @@ def get_accdoa_events(
         event_files[slug][float(timestamp)] = predictions[timestamp_idx]
 
 
+    max_frames = max(len(event_files[slug]) for slug in event_files)
     #This event dict has to contain file_names as key and the values should be frame_ind : [[detected_class_idx_1, 0, x, y, z, 0], [detected_class_idx_2, 0, x, y, z, 0]]
     #First key is the filename, and the second key in the dict is the frame_idx.    
     event_dict: Dict[
@@ -972,7 +971,7 @@ def get_accdoa_events(
         accdoa_dict, diff = get_accdoa_labels(event_files[file_name], nb_classes)
         event_dict[file_name] = accdoa_dict
 
-    return event_dict, diff
+    return event_dict, diff, max_frames
 
 
 def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
@@ -1326,17 +1325,34 @@ def map_to_frames(target_events: Dict[str, List[Dict[str, Any]]], timestamps: Di
 
     return timestamp_labels
 
+#Only to be used with evaluation data
 def load_timestamps(embedding_path, metadata, split_name):
-    import os 
     filename_timestamps_json = embedding_path.joinpath(
         f"{split_name}.filename-timestamps.json"
     )
     timestamps_ = {} 
-    for filename, timestamps in json.load(open(filename_timestamps_json)):
+    frames_for_labels = metadata.get("_nb_label_frames_1s", None)
+    #Keep track of filenames to populate timestamps if necessary.
+    filenames = set()
+    for filename, timestamp in json.load(open(filename_timestamps_json)):
         filename = os.path.basename(filename)
         if filename not in timestamps_:
           timestamps_[filename] = []
-        timestamps_[filename].append(timestamps)
+        
+        timestamps_[filename].append(float(timestamp))
+        filenames.add(filename)
+    
+    #If there is a specification for labels, then get that specification.
+    if frames_for_labels is not None:
+      timestamps_new = {}
+      for filename in filenames:
+            sorted_steps = sorted(timestamps_[filename])
+            last_time_stamp = sorted_steps[-1]
+            label_resolution = 1000 // frames_for_labels
+            arr = [m for m in range(0, int(last_time_stamp + label_resolution), label_resolution)]
+            timestamps_new[filename] = arr
+      return timestamps_new
+    
     return timestamps_
 
 

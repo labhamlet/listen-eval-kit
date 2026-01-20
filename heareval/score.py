@@ -504,7 +504,7 @@ def least_distance_between_gt_pred(gt_list, pred_list):
     return cost, row_ind, col_ind
 
   
-def segment_labels(_pred_dict, _max_frames, _nb_label_frames_1s):
+def segment_labels(_pred_dict, _max_frames, nb_frames_1s):
     '''
         Collects class-wise sound event location information in segments of length 1s from reference dataset
     :param _pred_dict: Dictionary containing frame-wise sound event time and location information. Output of SELD method
@@ -512,16 +512,16 @@ def segment_labels(_pred_dict, _max_frames, _nb_label_frames_1s):
     :return: Dictionary containing class-wise sound event location information in each segment of audio
             dictionary_name[segment-index][class-index] = list(frame-cnt-within-segment, azimuth, elevation)
     '''
-    nb_blocks = int(np.ceil(_max_frames/float(_nb_label_frames_1s)))
+    nb_blocks = int(np.ceil(_max_frames/float(nb_frames_1s)))
     output_dict = {x: {} for x in range(nb_blocks)}
-    for frame_cnt in range(0, _max_frames, _nb_label_frames_1s):
+    for frame_cnt in range(0, _max_frames, nb_frames_1s):
 
         # Collect class-wise information for each block
         # [class][frame] = <list of doa values>
         # Data structure supports multi-instance occurence of same class
-        block_cnt = frame_cnt // _nb_label_frames_1s
+        block_cnt = frame_cnt // nb_frames_1s
         loc_dict = {}
-        for audio_frame in range(frame_cnt, frame_cnt+_nb_label_frames_1s):
+        for audio_frame in range(frame_cnt, frame_cnt+nb_frames_1s):
             if audio_frame not in _pred_dict:
                 continue
             for value in _pred_dict[audio_frame]:
@@ -903,6 +903,7 @@ class OldSELD(ScoreFunction):
         pred_dicts,
         ref_dicts,
         _nb_label_frames_1s,
+        _nb_pred_frames_1s,
         _max_frames) -> Tuple[Tuple[str, float], ...]:
         
         overall_scores = {}
@@ -985,10 +986,12 @@ class SELD(ScoreFunction):
         self.nb_classes = len(self.label_to_idx)
 
     #MAX FRAMES passed here, but not used. It is for the completeness of the whole class.
+    #max_frames refer to the maximum number of frames in the dataset.
     def _compute(self,
         pred_dicts,
         ref_dicts,
         _nb_label_frames_1s,
+        _nb_pred_frames_1s,
         _max_frames) -> Tuple[Tuple[str, float], ...]:
         
         overall_scores = {}
@@ -1001,8 +1004,10 @@ class SELD(ScoreFunction):
             pred_dict = convert_output_format_cartesian_to_polar(pred_dict)
             #ref_dict is already in polar format!
             nb_ref_frames = max(list(ref_dict.keys()))
-            pred_labels = segment_labels(pred_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
-            ref_labels = segment_labels(ref_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
+            #Segments the pred dicti
+            nb_pred_frames = max(list(pred_dict.keys()))
+            pred_labels = segment_labels(pred_dict, nb_pred_frames, nb_frames_1s=_nb_pred_frames_1s)
+            ref_labels = segment_labels(ref_dict, nb_ref_frames, nb_frames_1s=_nb_label_frames_1s)
             eval.update_seld_scores(pred_labels, ref_labels)
 
         # Overall SED and DOA scores
