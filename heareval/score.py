@@ -1005,9 +1005,13 @@ class SELD(ScoreFunction):
             #ref_dict is already in polar format!
             nb_ref_frames = max(list(ref_dict.keys()))
             #Segments the pred dicti
-            nb_pred_frames = max(list(pred_dict.keys()))
-            pred_labels = segment_labels(pred_dict, nb_pred_frames, nb_frames_1s=_nb_pred_frames_1s)
-            ref_labels = segment_labels(ref_dict, nb_ref_frames, nb_frames_1s=_nb_label_frames_1s)
+            if _nb_pred_frames_1s == _nb_label_frames_1s:
+              pred_labels = segment_labels(pred_dict, nb_ref_frames, nb_frames_1s=_nb_pred_frames_1s)
+              ref_labels = segment_labels(ref_dict, nb_ref_frames, nb_frames_1s=_nb_label_frames_1s)
+            else:
+              nb_pred_frames = int(nb_ref_frames * (_nb_pred_frames_1s / _nb_pred_frames_1s))
+              pred_labels = segment_labels(pred_dict, nb_pred_frames, nb_frames_1s=_nb_pred_frames_1s)
+              ref_labels = segment_labels(ref_dict, nb_ref_frames, nb_frames_1s=_nb_pred_frames_1s)
             eval.update_seld_scores(pred_labels, ref_labels)
 
         # Overall SED and DOA scores
