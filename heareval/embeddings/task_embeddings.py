@@ -483,4 +483,4 @@ def task_embeddings(
         open(
             embed_task_dir.joinpath("filename-lengths-ms.json"),
             "wt",
-        ).write(json.dumps(audio_lengths, indent=4))`
+        ).write(json.dumps(audio_lengths, indent=4))
