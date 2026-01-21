@@ -77,17 +77,17 @@ TASK_SPECIFIC_PARAM_GRID = {
         "patience": [3],
     },
     "tau2021": {
-        "check_val_every_n_epoch": [25],
-        "patience": [3],
+        "check_val_every_n_epoch": [3],
+        "patience": [10],
     },
-    "starss2023": {
-        "check_val_every_n_epoch": [25],
-        "patience": [3],
+    "starss23": {
+        "check_val_every_n_epoch": [10],
+        "patience": [10],
     },
 }
 
 PARAM_GRID = {
-    "hidden_layers": [1, 2],
+    "hidden_layers": [3],
     # "hidden_layers": [0, 1, 2],
     # "hidden_layers": [1, 2, 3],
     "hidden_dim": [1024],
@@ -100,12 +100,12 @@ PARAM_GRID = {
     # "dropout": [0.1, 0.3, 0.5],
     # "dropout": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
     # "dropout": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-    "lr": [3.2e-3, 1e-3, 3.2e-4, 1e-4],
+    "lr": [1e-4],
     # "lr": [3.2e-3, 1e-3, 3.2e-4, 1e-4, 3.2e-5, 1e-5],
     # "lr": [1e-2, 3.2e-3, 1e-3, 3.2e-4, 1e-4],
     # "lr": [1e-1, 1e-2, 1e-3, 1e-4, 1e-5],
     "patience": [20],
-    "max_epochs": [500],
+    "max_epochs": [1000],
     # "max_epochs": [500, 1000],
     "check_val_every_n_epoch": [3],
     # "check_val_every_n_epoch": [1, 3, 10],
@@ -120,7 +120,7 @@ PARAM_GRID = {
     "embedding_norm": [torch.nn.Identity],
     # "embedding_norm": [torch.nn.Identity, torch.nn.BatchNorm1d],
     # "embedding_norm": [torch.nn.Identity, torch.nn.BatchNorm1d, torch.nn.LayerNorm],
-    "initialization": [torch.nn.init.xavier_uniform_, torch.nn.init.xavier_normal_],
+    "initialization": [torch.nn.init.xavier_normal_],
     "optim": [torch.optim.Adam],
     # "optim": [torch.optim.Adam, torch.optim.SGD],
 }
@@ -553,7 +553,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
         if name == "test" or self.use_scoring_for_early_stopping:
             #Here we get events for all files per filename.
             #TODO finish mapping this!
-            pred_events, diff = get_accdoa_events(
+            pred_events, diff, _max_frames = get_accdoa_events(
                 prediction,
                 filename,
                 timestamp,
@@ -566,6 +566,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                   label_to_idx=self.label_to_idx
               )
             _nb_pred_frames_1s = int(1000 // diff)
+            #Get the number of label frames and pred frames per second.
             _nb_label_frames_1s = _nb_pred_frames_1s if self.source == "static" else self._nb_label_frames_1s
             self.log_scores(
                 name, score_args=(pred_events,
@@ -892,15 +893,14 @@ def get_ref_accdoa_events(
     max_frames : Dict[str, int] = {}
     for filename in ref_timestamps:
         filename = os.path.basename(filename)
+        if filename not in event_dict:
+            event_dict[filename] = {}
         # Loads from the test/valid folds.
         assert sorted(ref_timestamps[filename]) == ref_timestamps[filename], f"Timestamps for {filename} is not sorted!"
         
-        if len(ref_timestamps[filename]) > max_timestamps:
-            max_timestamps = len(ref_timestamps[filename])
-
         #Here just get the frame_idx from the timestamp information
-        for timestamp_idx in range(len(ref_timestamps[filename])):
-          events = references[filename][timestamp_idx]
+        for frame_ind in range(len(ref_timestamps[filename])):
+          events = references[filename][frame_ind]
           if len(events) != 0: #If there is an active event
             for event in events:
               class_str = event[0]
@@ -965,7 +965,8 @@ def get_accdoa_events(
     #How many frames were there in the audio? 
     max_frames : Dict[str, int] = {}
     #This event dict has to contain file_names as key and the values should be frame_ind : [[detected_class_idx_1, 0, x, y, z, 0], [detected_class_idx_2, 0, x, y, z, 0]]
-    #First key is the filename, and the second key in the dict is the frame_idx.    
+    #First key is the filename, and the second key in the dict is the frame_idx.   \
+    #contains only the detected classes. 
     event_dict: Dict[
         str, Dict[int, List[List[int | float]]]
     ] = {}
@@ -975,7 +976,7 @@ def get_accdoa_events(
         event_dict[file_name] = accdoa_dict
         max_frames[file_name] = max_frame
 
-    return event_dict, diff
+    return event_dict, diff, max_frames
 
 
 def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
