@@ -475,7 +475,7 @@ def task_embeddings(
                 assert len(labels) == len(filenames)
                 assert len(labels[0]) == len(timestamps[0])
                 save_timestamp_embedding_and_labels(
-                    embeddings, timestamps, labels, filenames, audio_lengths
+                    embeddings, timestamps, labels, filenames, outdir
                 )
             else:
                 raise ValueError(
