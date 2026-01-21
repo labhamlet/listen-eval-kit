@@ -185,7 +185,7 @@ class AudioFileDataset(Dataset):
         audio_path = self.audio_dir.joinpath(self.filenames[idx])
         audio, sr = sf.read(str(audio_path), dtype=np.float32)
         assert sr == self.sample_rate
-        return audio, self.filenames[idx]
+        return audio, self.filenames[idx], (max(audio.shape) / sr) * 1000
 
 
 def get_dataloader_for_embedding(
@@ -231,7 +231,6 @@ def save_timestamp_embedding_and_labels(
         json.dump(timestamps[i].tolist(), open(f"{out_file}.timestamps.json", "w"))
         json.dump(labels[i], open(f"{out_file}.target-labels.json", "w"), indent=4)
 
-
 def get_labels_for_timestamps(labels: List, timestamps: np.ndarray, source: Optional[str]) -> List:
     # -> List[List[List[str]]]:
     # -> List[List[str]]:
@@ -245,22 +244,16 @@ def get_labels_for_timestamps(labels: List, timestamps: np.ndarray, source: Opti
         tree = IntervalTree()
         # Add all events to the label tree
         for event in label:
-            # We add 0.0001 so that the end also includes the event
-            # Here we add the direction of the event if the interval tree actually contains it!
-            #If we have same events with different directions it assumed that it is already handeled
-            #Before we pass to this function.
-            
             if "direction" in event:
                 assert source is not None, "Got source None, please pass source_dyamics: (dynamic, static) in metadata"
             if "direction" in event and source == "static":
-                tree.addi(event["start"], event["end"] + 0.0001, (event["label"], event["direction"]))
+                tree.addi(event["start"], event["end"], (event["label"], event["direction"]))
             elif "direction" in event and source == "dynamic":
                 assert "source_idx" in event, "Events do not contain a source idx"
-                #For [0,100), [100, 200) ... we are substracting a very small amount from the end label
-                #so that the dynamic direction information can still be preserved and not overlapped
-                #TODO! Change this line once we add Multi-ACCDOA training, for now do not support it.
-                tree.addi(event["start"], event["end"] - 0.0001, (event["label"], event["direction"]))
+                tree.addi(event["start"], event["end"], (event["label"], event["direction"]))
             elif "direction" not in event and source is None:
+                #adding 0.0001 so that end includes the event, but is it really necessary?
+                #This is from hear-eval-kit
                 tree.addi(event["start"], event["end"] + 0.0001, event["label"])
             else:
                 raise ValueError("Got direction and source not matching")
@@ -291,6 +284,7 @@ def memmap_embeddings(
     split_name: str,
     embed_task_dir: Path,
     split_data: Dict,
+    audio_lengths: Optional[Dict[str, float]],
 ):
     """
     Memmap all the embeddings to one file, and pickle all the labels.
@@ -391,10 +385,15 @@ def memmap_embeddings(
 
     if metadata["embedding_type"] == "event":
         assert len(labels) == len(filename_timestamps)
+        assert len(audio_lengths) != 0
         open(
             embed_task_dir.joinpath(f"{split_name}.filename-timestamps.json"),
             "wt",
         ).write(json.dumps(filename_timestamps, indent=4))
+        open(
+            embed_task_dir.joinpath("filename-lengths-ms.json"),
+            "wt",
+        ).write(json.dumps(audio_lengths, indent=4))
 
 
 def task_embeddings(
@@ -456,7 +455,8 @@ def task_embeddings(
         if not os.path.exists(outdir):
             os.makedirs(outdir)
 
-        for audios, filenames in tqdm(dataloader):
+        audio_lengths = {}
+        for audios, filenames, lengths in tqdm(dataloader):
             labels = [split_data[file] for file in filenames]
 
             if metadata["embedding_type"] == "scene":
@@ -467,15 +467,19 @@ def task_embeddings(
                 embeddings, timestamps = embedding.get_timestamp_embedding_as_numpy(
                     audios
                 )
+
+                for audio, filename, length in zip(audios, filenames, lengths):
+                    audio_lengths[filename] = length
+
                 labels = get_labels_for_timestamps(labels, timestamps, metadata.get("source_dynamics", None))
                 assert len(labels) == len(filenames)
                 assert len(labels[0]) == len(timestamps[0])
                 save_timestamp_embedding_and_labels(
-                    embeddings, timestamps, labels, filenames, outdir,
+                    embeddings, timestamps, labels, filenames, audio_lengths
                 )
             else:
                 raise ValueError(
                     f"Unknown embedding type: {metadata['embedding_type']}"
                 )
 
-        memmap_embeddings(outdir, prng, metadata, split, embed_task_dir, split_data)
+        memmap_embeddings(outdir, prng, metadata, split, embed_task_dir, split_data, audio_lengths)

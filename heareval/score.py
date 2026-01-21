@@ -903,7 +903,9 @@ class OldSELD(ScoreFunction):
         pred_dicts,
         ref_dicts,
         _nb_label_frames_1s,
-        _max_frames) -> Tuple[Tuple[str, float], ...]:
+        _nb_pred_frames_1s,
+        _max_frames,
+        _max_ref_frames) -> Tuple[Tuple[str, float], ...]:
         
         overall_scores = {}
         eval = OldSELDMetrics(nb_frames_1s=_nb_label_frames_1s, data_gen=self)
@@ -911,6 +913,8 @@ class OldSELD(ScoreFunction):
         for file_name in pred_dicts.keys():
             pred_dict = pred_dicts[file_name]
             ref_dict = ref_dicts[file_name]
+            _max_frame = _max_frames[file_name]
+            _max_ref_frames = _max_ref_frames[file_name]
 
             #Our prediction dict is in cartesian format, so convert it to polar!
             pred_dict = convert_output_format_cartesian_to_polar(pred_dict)
@@ -918,7 +922,7 @@ class OldSELD(ScoreFunction):
             ref_dict = convert_output_format_new_to_old(ref_dict)
 
             #Convert from regression to classification for DOA, the max_frames is indeed the same as prediction labels.
-            gt_labels = self.output_format_dict_to_classification_labels(ref_dict, _max_frames)
+            gt_labels = self.output_format_dict_to_classification_labels(ref_dict, _max_ref_frames)
             pred_labels = self.output_format_dict_to_classification_labels(pred_dict, _max_frames)
             # Calculated SED and DOA scores
 
@@ -989,7 +993,9 @@ class SELD(ScoreFunction):
         pred_dicts,
         ref_dicts,
         _nb_label_frames_1s,
-        _max_frames) -> Tuple[Tuple[str, float], ...]:
+        _nb_pred_frames_1s,
+        _max_frames,
+        _max_ref_frames) -> Tuple[Tuple[str, float], ...]:
         
         overall_scores = {}
 
@@ -997,12 +1003,13 @@ class SELD(ScoreFunction):
         for file_name in pred_dicts.keys():
             pred_dict = pred_dicts[file_name]
             ref_dict = ref_dicts[file_name]
+            _max_frame = _max_frames[file_name]
+            _max_ref_frames = _max_ref_frames[file_name]
             #Our prediction dict is in cartesian format, so convert it to polar!
             pred_dict = convert_output_format_cartesian_to_polar(pred_dict)
-            #ref_dict is already in polar format!
-            nb_ref_frames = max(list(ref_dict.keys()))
-            pred_labels = segment_labels(pred_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
-            ref_labels = segment_labels(ref_dict, nb_ref_frames, _nb_label_frames_1s=_nb_label_frames_1s)
+            
+            pred_labels = segment_labels(pred_dict, _max_frame, nb_frames_1s=_nb_pred_frames_1s)
+            ref_labels = segment_labels(ref_dict, _max_ref_frame, nb_frames_1s=_nb_label_frames_1s)
             eval.update_seld_scores(pred_labels, ref_labels)
 
         # Overall SED and DOA scores

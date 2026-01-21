@@ -559,7 +559,7 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 timestamp,
                 self.nlabels
             )
-            ref_events, max_timestamps = get_ref_accdoa_events(
+            ref_events, _max_ref_frames = get_ref_accdoa_events(
                   self.target_events[name],             
                   self.target_timestamps[name],
                   self.nlabels,
@@ -571,7 +571,9 @@ class ACCDOAPredictionModel(AbstractPredictionModel):
                 name, score_args=(pred_events,
                     ref_events,
                     _nb_label_frames_1s,
-                    max_timestamps
+                    _nb_pred_frames_1s,
+                    _max_frames,
+                    _max_ref_frames
                     )
             )
             if name == "test":
@@ -887,7 +889,7 @@ def get_ref_accdoa_events(
         str, Dict[int, List[List[int | float]]]
     ] = {}
 
-    max_timestamps = float("-inf")
+    max_frames : Dict[str, int] = {}
     for filename in ref_timestamps:
         filename = os.path.basename(filename)
         # Loads from the test/valid folds.
@@ -907,14 +909,12 @@ def get_ref_accdoa_events(
               class_idx = label_to_idx[str(class_str)]
               if filename not in event_dict:
                 event_dict[filename] = {}
-              if timestamp_idx not in event_dict[filename]:
-                event_dict[filename][timestamp_idx] = []
-              #class_id, source_id,
-              #Wait, we actually do not have a source here for overlapping events more than two.
-              #TODO check this.
-              event_dict[filename][timestamp_idx].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
-
-    return event_dict, max_timestamps
+              if frame_ind not in event_dict[filename]:
+                event_dict[filename][frame_ind] = []
+            
+              event_dict[filename][frame_ind].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
+        max_frames[file_name] = frame_ind
+    return event_dict
 
 def get_accdoa_events(
     predictions: torch.Tensor,
@@ -962,6 +962,8 @@ def get_accdoa_events(
         event_files[slug][float(timestamp)] = predictions[timestamp_idx]
 
 
+    #How many frames were there in the audio? 
+    max_frames : Dict[str, int] = {}
     #This event dict has to contain file_names as key and the values should be frame_ind : [[detected_class_idx_1, 0, x, y, z, 0], [detected_class_idx_2, 0, x, y, z, 0]]
     #First key is the filename, and the second key in the dict is the frame_idx.    
     event_dict: Dict[
@@ -969,8 +971,9 @@ def get_accdoa_events(
     ] = {}
     
     for file_name in tqdm(event_files.keys()):
-        accdoa_dict, diff = get_accdoa_labels(event_files[file_name], nb_classes)
+        accdoa_dict, diff, max_frame = get_accdoa_labels(event_files[file_name], nb_classes)
         event_dict[file_name] = accdoa_dict
+        max_frames[file_name] = max_frame
 
     return event_dict, diff
 
@@ -984,27 +987,35 @@ def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
         accdoa_vectors: Array (Total_Frames, nb_classes, 3). Format [x, y, z].
         frame_interval: Float (time difference between frames) or Default 0.02.
     """
-    
-    # 1. Handle Input (Dict vs Tensor) & Timestamps
+
     timestamps = sorted(accdoa_in.keys())
+    #For each timestamp, we have predictions!
     predictions_list = [accdoa_in[t].detach().cpu().numpy() for t in timestamps]
-    #Predictions per timestamp (actually frame)
     accdoa_vectors = np.stack(predictions_list)
     predictions = {} 
-    for time_frame in range(len(accdoa_vectors)):
-        timestamp_prediction = accdoa_vectors[time_frame] 
-        x = timestamp_prediction[:, 0]
-        y = timestamp_prediction[:, 1]
-        z = timestamp_prediction[:, 2]
-        sed_magnitude = np.sqrt(x**2 + y**2 + z**2)
-        sed = np.where(sed_magnitude > 0.5)[0]
-        if time_frame not in predictions: 
-            predictions[time_frame] = [] 
-        #For each predicted class, append the class index and float to the predictions
-        for class_idx in sed:
-            predictions[time_frame].append([int(class_idx), 0, float(x[class_idx]), float(y[class_idx]), float(z[class_idx]), 0])
 
-    return predictions, np.mean(np.diff(np.array(timestamps)))
+    #The time frame for the accdoa vectors.
+    for time_frame in range(len(accdoa_vectors)):
+        #Get the prediction!
+        timestamp_prediction = accdoa_vectors[time_frame] 
+        sed_magnitudes = np.linalg.norm(timestamp_prediction, axis=1)
+        # Find indices where magnitude > 0.5 
+        active_classes = np.where(sed_magnitudes > 0.5)[0]
+        #If there was an active class, append it to the predictions dictonary.
+        if len(active_classes) > 0:
+            predictions[frame_idx] = []
+            for class_idx in active_classes:
+                x, y, z = current_frame[class_idx]
+                predictions[frame_idx].append([
+                    int(class_idx), 
+                    0, 
+                    float(x), 
+                    float(y), 
+                    float(z), 
+                    0
+                ])
+    #Here we return the predictions, model_resolution, and the maximum number of frames in the audio.
+    return predictions, np.mean(np.diff(np.array(timestamps))), time_frame
 
 
 def create_events_from_prediction(
@@ -1303,41 +1314,84 @@ class GridPointResult:
 
 
 def map_to_frames(target_events: Dict[str, List[Dict[str, Any]]], timestamps: Dict[str, List[float]], metadata):
-    #Maps to frames:
-    # {'c0e28dc8.wav': [{'label': 'jack_hammer', 'direction': [-0.5751132772097123, -0.33771451916904743, 0.7451131604793488], 'start': 345.88007775, 'end': 4345.88007775}
-    # A list of labels present at each timestamp
     timestamp_labels = {}
 
+    #For each file, we append the events that occur.
     for file_name in target_events:
         events = target_events[file_name]
         tree = IntervalTree()
         for event in events:
-            if metadata["source_dynamics"] == "static":
-                tree.addi(event["start"], event["end"] + 0.001, (event["label"], event["direction"]))
-            elif metadata["source_dynamics"] == "dynamic":
-                tree.addi(event["start"], event["end"] - 0.001, (event["label"], event["direction"]))
-            else:
-                raise ValueError("source dyamics must be static or dynamic")
+            tree.addi(event["start"], event["end"], (event["label"], event["direction"]))
         labels_for_sound = []
+        #At each timestamp from the model, append it to the labels.
         for time_stamp in timestamps[file_name]:
-            interval_labels: List[str | Tuple[str, List[float]]] = [interval.data for interval in tree[time_stamp]]
+            interval_labels: List[Optional[Tuple[str, List[float]]]] = [interval.data for interval in tree[time_stamp]]
             labels_for_sound.append(interval_labels)
+            #At the end, we have [[Class_name, direction]]
+            #If there was no event active at that time stamp, we have an empty array.
+            #If there were multiple events, than it is List[List]
         timestamp_labels[file_name] = labels_for_sound
 
     return timestamp_labels
 
+# Only to be used with evaluation data
 def load_timestamps(embedding_path, metadata, split_name):
-    import os 
-    filename_timestamps_json = embedding_path.joinpath(
+    """
+    Load timestamps for audio files.
+    
+    Args:
+        embedding_path: Path to embeddings directory
+        metadata: Metadata dict containing optional '_nb_label_frames_1s'
+        split_name: Name of the data split
+        
+    Returns:
+        dict: Mapping of filename to list of timestamps
+    """
+    label_frame_resolution = metadata.get("_nb_label_frames_1s")
+    
+    if label_frame_resolution is not None:
+        return _load_timestamps_from_lengths(embedding_path, label_frame_resolution)
+    else:
+        return _load_timestamps_from_json(embedding_path, split_name)
+
+
+def _load_timestamps_from_lengths(embedding_path, label_frame_resolution):
+    """Generate timestamps from audio lengths and frame count."""
+    filename_lengths_path = embedding_path.joinpath("filename-lengths-ms.json")
+    
+    with open(filename_lengths_path) as f:
+        filename_to_length = json.load(f)
+    
+    label_resolution_ms = 1000 // label_frame_resolution
+    timestamps = {}
+    
+    for filename, length_ms in filename_to_length.items():
+        timestamps[filename] = list(range(
+            0, 
+            int(length_ms + label_resolution_ms), 
+            label_resolution_ms
+        ))
+    
+    return timestamps
+
+
+def _load_timestamps_from_json(embedding_path, split_name):
+    """Load timestamps from pre-existing JSON file."""
+    timestamps_path = embedding_path.joinpath(
         f"{split_name}.filename-timestamps.json"
     )
-    timestamps_ = {} 
-    for filename, timestamps in json.load(open(filename_timestamps_json)):
+    
+    with open(timestamps_path) as f:
+        timestamp_pairs = json.load(f)
+    
+    timestamps = {}
+    for filename, timestamp in timestamp_pairs:
         filename = os.path.basename(filename)
-        if filename not in timestamps_:
-          timestamps_[filename] = []
-        timestamps_[filename].append(timestamps)
-    return timestamps_
+        if filename not in timestamps:
+            timestamps[filename] = []
+        timestamps[filename].append(float(timestamp))
+    
+    return timestamps
 
 
 def task_predictions_train(
@@ -1414,6 +1468,7 @@ def task_predictions_train(
                 _timestamps_valid.update(load_timestamps(embedding_path, metadata, split_name))
             for split_name in data_splits["test"]:
                 _timestamps_test.update(load_timestamps(embedding_path, metadata, split_name))
+            #This gives us a dictionary of the events where an event is active.
             validation_target_events: Dict = map_to_frames(validation_target_events, _timestamps_valid, metadata)
             test_target_events: Dict = map_to_frames(test_target_events, _timestamps_test, metadata)
         
