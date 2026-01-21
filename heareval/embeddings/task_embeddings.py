@@ -284,6 +284,7 @@ def memmap_embeddings(
     split_name: str,
     embed_task_dir: Path,
     split_data: Dict,
+    audio_lengths : Optional[Dict[str, float]]
 ):
     """
     Memmap all the embeddings to one file, and pickle all the labels.
@@ -384,10 +385,16 @@ def memmap_embeddings(
 
     if metadata["embedding_type"] == "event":
         assert len(labels) == len(filename_timestamps)
+        assert len(audio_lengths) != 0
+
         open(
             embed_task_dir.joinpath(f"{split_name}.filename-timestamps.json"),
             "wt",
         ).write(json.dumps(filename_timestamps, indent=4))
+        open(
+            embed_task_dir.joinpath(f"{split_name}.filename-lengths-ms.json"),
+            "wt",
+        ).write(json.dumps(audio_lengths, indent=4))
 
 
 def task_embeddings(
@@ -409,11 +416,10 @@ def task_embeddings(
         os.makedirs(embed_task_dir)
     shutil.copy(metadata_path, embed_task_dir)
     shutil.copy(label_vocab_path, embed_task_dir)
-    audio_lengths = {}
 
     for split in metadata["splits"]:
         print(f"Getting embeddings for split: {split}")
-
+        audio_lengths = {}
         split_path = task_path.joinpath(f"{split}.json")
         assert split_path.is_file()
 
@@ -476,11 +482,4 @@ def task_embeddings(
                     f"Unknown embedding type: {metadata['embedding_type']}"
                 )
 
-        memmap_embeddings(outdir, prng, metadata, split, embed_task_dir, split_data)
-    
-    if metadata["embedding_type"] == "event":
-        assert len(audio_lengths) != 0
-        open(
-            embed_task_dir.joinpath("filename-lengths-ms.json"),
-            "wt",
-        ).write(json.dumps(audio_lengths, indent=4))
+        memmap_embeddings(outdir, prng, metadata, split, embed_task_dir, split_data, audio_lengths)
