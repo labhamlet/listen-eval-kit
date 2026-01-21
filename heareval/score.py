@@ -1005,7 +1005,7 @@ class SELD(ScoreFunction):
             pred_dict = pred_dicts[file_name]
             ref_dict = ref_dicts[file_name]
             _max_frame = _max_frames[file_name]
-            _max_ref_frames = _max_ref_frames[file_name]
+            _max_ref_frame = _max_ref_frames[file_name]
             #Our prediction dict is in cartesian format, so convert it to polar!
             pred_dict = convert_output_format_cartesian_to_polar(pred_dict)
             

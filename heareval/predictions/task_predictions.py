@@ -1351,14 +1351,16 @@ def load_timestamps(embedding_path, metadata, split_name):
     label_frame_resolution = metadata.get("_nb_label_frames_1s")
     
     if label_frame_resolution is not None:
-        return _load_timestamps_from_lengths(embedding_path, label_frame_resolution)
+        return _load_timestamps_from_lengths(embedding_path, split_name, label_frame_resolution)
     else:
         return _load_timestamps_from_json(embedding_path, split_name)
 
 
-def _load_timestamps_from_lengths(embedding_path, label_frame_resolution):
+def _load_timestamps_from_lengths(embedding_path, split_name, label_frame_resolution):
     """Generate timestamps from audio lengths and frame count."""
-    filename_lengths_path = embedding_path.joinpath("filename-lengths-ms.json")
+    filename_lengths_path = embedding_path.joinpath(
+        f"{split_name}.filename-lengths-ms.json"
+    )
     
     with open(filename_lengths_path) as f:
         filename_to_length = json.load(f)
