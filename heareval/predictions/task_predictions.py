@@ -913,7 +913,7 @@ def get_ref_accdoa_events(
                 event_dict[filename][frame_ind] = []
             
               event_dict[filename][frame_ind].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
-        max_frames[file_name] = frame_ind
+        max_frames[filename] = frame_ind
     return event_dict
 
 def get_accdoa_events(
@@ -996,10 +996,10 @@ def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
     predictions = {} 
 
     #The time frame for the accdoa vectors.
-    for time_frame in range(len(accdoa_vectors)):
+    for frame_idx in range(len(accdoa_vectors)):
         #Get the prediction!
-        timestamp_prediction = accdoa_vectors[time_frame] 
-        sed_magnitudes = np.linalg.norm(timestamp_prediction, axis=1)
+        current_frame = accdoa_vectors[frame_idx] 
+        sed_magnitudes = np.linalg.norm(current_frame, axis=1)
         # Find indices where magnitude > 0.5 
         active_classes = np.where(sed_magnitudes > 0.5)[0]
         #If there was an active class, append it to the predictions dictonary.
@@ -1016,7 +1016,7 @@ def get_accdoa_labels(accdoa_in, nb_classes) -> Dict[int, List[List[int]]]:
                     0
                 ])
     #Here we return the predictions, model_resolution, and the maximum number of frames in the audio.
-    return predictions, np.mean(np.diff(np.array(timestamps))), time_frame
+    return predictions, np.mean(np.diff(np.array(timestamps))), frame_idx
 
 
 def create_events_from_prediction(
