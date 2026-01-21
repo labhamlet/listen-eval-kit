@@ -1008,9 +1008,13 @@ class SELD(ScoreFunction):
             _max_ref_frame = _max_ref_frames[file_name]
             #Our prediction dict is in cartesian format, so convert it to polar!
             pred_dict = convert_output_format_cartesian_to_polar(pred_dict)
-            
-            pred_labels = segment_labels(pred_dict, _max_frame, nb_frames_1s=_nb_pred_frames_1s)
-            ref_labels = segment_labels(ref_dict, _max_ref_frame, nb_frames_1s=_nb_label_frames_1s)
+            if _nb_label_frames_1s == _nb_pred_frames_1s:
+                max_frames = max(list(pred_dict.keys()))
+                pred_labels = segment_labels(pred_dict, max_frames, nb_frames_1s=_nb_label_frames_1s)
+                ref_labels = segment_labels(ref_dict, max_frames, nb_frames_1s=_nb_label_frames_1s)
+            else:
+                pred_labels = segment_labels(pred_dict, _max_frames, nb_frames_1s=_nb_pred_frames_1s)
+                ref_labels = segment_labels(ref_dict, _max_ref_frames, nb_frames_1s=_nb_label_frames_1s)
             eval.update_seld_scores(pred_labels, ref_labels)
 
         # Overall SED and DOA scores

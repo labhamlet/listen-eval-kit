@@ -87,7 +87,7 @@ TASK_SPECIFIC_PARAM_GRID = {
 }
 
 PARAM_GRID = {
-    "hidden_layers": [3],
+    "hidden_layers": [2],
     # "hidden_layers": [0, 1, 2],
     # "hidden_layers": [1, 2, 3],
     "hidden_dim": [1024],
@@ -914,7 +914,7 @@ def get_ref_accdoa_events(
             
               event_dict[filename][frame_ind].append([class_idx, 0, float(doa_tuple[0]), float(doa_tuple[1])])
         max_frames[filename] = frame_ind
-    return event_dict
+    return event_dict, max_frames
 
 def get_accdoa_events(
     predictions: torch.Tensor,
