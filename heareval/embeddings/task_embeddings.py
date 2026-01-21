@@ -478,9 +478,9 @@ def task_embeddings(
 
         memmap_embeddings(outdir, prng, metadata, split, embed_task_dir, split_data)
     
-        if metadata["embedding_type"] == "event":
-            assert len(audio_lengths) != 0
-            open(
-                embed_task_dir.joinpath("filename-lengths-ms.json"),
-                "wt",
-            ).write(json.dumps(audio_lengths, indent=4))
+    if metadata["embedding_type"] == "event":
+        assert len(audio_lengths) != 0
+        open(
+            embed_task_dir.joinpath("filename-lengths-ms.json"),
+            "wt",
+        ).write(json.dumps(audio_lengths, indent=4))`
