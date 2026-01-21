@@ -56,16 +56,40 @@ TASK_SPECIFIC_PARAM_GRID = {
         # sed_eval is very slow
         "check_val_every_n_epoch": [10],
     },
+    "tau2018_ov1_split1": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },    
+    "tau2018_ov1_split8": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },    
+    "tau2018_ov1_split9": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },
+    "tau2018_ov2_split1": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },    
+    "tau2018_ov2_split8": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },    
+    "tau2018_ov2_split9": {
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
+    },
     "tau2018_ov3_split1": {
-        "check_val_every_n_epoch": [50],
+        "check_val_every_n_epoch": [25],
         "patience": [3],
     },    
     "tau2018_ov3_split8": {
-        "check_val_every_n_epoch": [50],
+        "check_val_every_n_epoch": [25],
         "patience": [3],
     },    
     "tau2018_ov3_split9": {
-        "check_val_every_n_epoch": [50],
+        "check_val_every_n_epoch": [25],
         "patience": [3],
     },
     "tau2019": {
@@ -77,17 +101,17 @@ TASK_SPECIFIC_PARAM_GRID = {
         "patience": [3],
     },
     "tau2021": {
-        "check_val_every_n_epoch": [3],
-        "patience": [10],
+        "check_val_every_n_epoch": [24],
+        "patience": [3],
     },
     "starss23": {
-        "check_val_every_n_epoch": [10],
-        "patience": [10],
+        "check_val_every_n_epoch": [25],
+        "patience": [3],
     },
 }
 
 PARAM_GRID = {
-    "hidden_layers": [2],
+    "hidden_layers": [1, 2],
     # "hidden_layers": [0, 1, 2],
     # "hidden_layers": [1, 2, 3],
     "hidden_dim": [1024],
@@ -100,12 +124,12 @@ PARAM_GRID = {
     # "dropout": [0.1, 0.3, 0.5],
     # "dropout": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
     # "dropout": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-    "lr": [1e-4],
+    "lr": [3.2e-3, 1e-3, 3.2e-4, 1e-4],
     # "lr": [3.2e-3, 1e-3, 3.2e-4, 1e-4, 3.2e-5, 1e-5],
     # "lr": [1e-2, 3.2e-3, 1e-3, 3.2e-4, 1e-4],
     # "lr": [1e-1, 1e-2, 1e-3, 1e-4, 1e-5],
     "patience": [20],
-    "max_epochs": [1000],
+    "max_epochs": [500],
     # "max_epochs": [500, 1000],
     "check_val_every_n_epoch": [3],
     # "check_val_every_n_epoch": [1, 3, 10],
@@ -120,7 +144,7 @@ PARAM_GRID = {
     "embedding_norm": [torch.nn.Identity],
     # "embedding_norm": [torch.nn.Identity, torch.nn.BatchNorm1d],
     # "embedding_norm": [torch.nn.Identity, torch.nn.BatchNorm1d, torch.nn.LayerNorm],
-    "initialization": [torch.nn.init.xavier_normal_],
+    "initialization": [torch.nn.init.xavier_uniform_, torch.nn.init.xavier_normal_],
     "optim": [torch.optim.Adam],
     # "optim": [torch.optim.Adam, torch.optim.SGD],
 }
