@@ -185,7 +185,7 @@ class AudioFileDataset(Dataset):
         audio_path = self.audio_dir.joinpath(self.filenames[idx])
         audio, sr = sf.read(str(audio_path), dtype=np.float32)
         assert sr == self.sample_rate
-        return audio, self.filenames[idx], float((max(audio.shape) / sr) * 1000)
+        return audio, self.filenames[idx], (max(audio.shape) / sr) * 1000
 
 
 def get_dataloader_for_embedding(
@@ -409,6 +409,7 @@ def task_embeddings(
         os.makedirs(embed_task_dir)
     shutil.copy(metadata_path, embed_task_dir)
     shutil.copy(label_vocab_path, embed_task_dir)
+    audio_lengths = {}
 
     for split in metadata["splits"]:
         print(f"Getting embeddings for split: {split}")
@@ -449,7 +450,6 @@ def task_embeddings(
         if not os.path.exists(outdir):
             os.makedirs(outdir)
 
-        audio_lengths = {}
         for audios, filenames, lengths in tqdm(dataloader):
             labels = [split_data[file] for file in filenames]
 
@@ -463,7 +463,7 @@ def task_embeddings(
                 )
 
                 for audio, filename, length in zip(audios, filenames, lengths):
-                    audio_lengths[filename] = length
+                    audio_lengths[filename] = length.item()
 
                 labels = get_labels_for_timestamps(labels, timestamps, metadata.get("source_dynamics", None))
                 assert len(labels) == len(filenames)
