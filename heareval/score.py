@@ -12,14 +12,11 @@ import sed_eval
 import torch
 
 # Can we get away with not using DCase for every event-based evaluation??
-import dcase_util 
 from dcase_util.containers import MetaDataContainer
 from scipy import stats
 from sklearn.metrics import average_precision_score, roc_auc_score
 
-import math 
 from scipy.optimize import linear_sum_assignment
-from IPython import embed
 
 
 eps = np.finfo(np.float64).eps
